@@ -104,8 +104,13 @@ def parse_credentials(username: str, password: str) -> dict:
 def normalize_channel_name(name: str) -> str:
     """
     Apply all normalization rules to a channel name.
+    Event/PPV/F1 channels are returned unchanged to preserve event info.
     """
     if not name:
+        return name
+    
+    # Skip normalization for event/F1/PPV channels - preserve their original names
+    if is_event_channel(name):
         return name
     
     original = name
@@ -166,6 +171,52 @@ def should_skip_channel(name: str) -> bool:
         return True
     if re.match(r'^-+$', name):
         return True
+    return False
+
+
+def is_event_channel(name: str) -> bool:
+    """
+    Check if this is an event/PPV/F1 channel that should NOT be normalized.
+    These channels have useful event info in their names that we want to preserve.
+    
+    Covers:
+    - F1 driver feeds (UK| FORMULA 1 PPV)
+    - F1 TV channels (┃NL┃ F1 TV PRO)
+    - VIAPLAY F1/F2/F3 replays
+    - Event streams with dates (NL| VIAPLAY PPV, NL| MAX PPV, etc.)
+    - MotoGP content
+    """
+    if not name:
+        return False
+    
+    # Event channels with date/time patterns like "@ Dec 13 09:10 AM"
+    if re.search(r'@\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d', name, re.IGNORECASE):
+        return True
+    
+    # F1 driver/feed channels (UK source) - pattern: "F1: DRIVER [TEAM]"
+    if re.match(r'^F1:', name, re.IGNORECASE):
+        return True
+    
+    # F1 TV channels (NL source) - pattern: "┃F1 TV┃ ..."
+    if '┃F1 TV┃' in name or '┃F1TV┃' in name:
+        return True
+    
+    # VIAPLAY F1/F2/F3 content (replays, seasons)
+    if re.search(r'VIAPLAY\s+F[123]', name, re.IGNORECASE):
+        return True
+    
+    # FORMULE (Dutch for Formula) - catches "VIAPLAY FORMULE 1"
+    if 'FORMULE' in name.upper():
+        return True
+    
+    # MotoGP channels
+    if 'MOTOGP' in name.upper():
+        return True
+    
+    # Sport event pattern "Sport: Event @ Date" (catches scheduled events)
+    if re.match(r'^[A-Za-z\s\-]+:\s+.+@', name):
+        return True
+    
     return False
 
 
