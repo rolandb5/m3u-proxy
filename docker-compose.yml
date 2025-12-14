@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  m3u-proxy:
+    build: .
+    container_name: m3u-proxy
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      # Port to serve on (default: 8765)
+      - PORT=8765
+      
+      # Cache duration in hours (default: 6)
+      - CACHE_HOURS=6

@@ -1,0 +1,16 @@
+# Environment files (may contain credentials)
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store

@@ -1,0 +1,17 @@
+# Xtream Codes Normalizing Proxy - Optional Settings
+# 
+# NO CONFIGURATION REQUIRED for basic usage!
+# Just run: docker-compose up -d
+#
+# Provider credentials are configured in Dispatcharr, not here.
+# See README.md for details.
+
+# =====================================================
+# Optional: Server Settings
+# =====================================================
+
+# Port the proxy listens on (default: 8765)
+# PORT=8765
+
+# How long to cache API responses, in hours (default: 6)
+# CACHE_HOURS=6
