@@ -56,11 +56,12 @@ def parse_credentials(username: str, password: str) -> dict:
     """
     Parse the username to extract provider info.
     
-    Format: realuser@host:port
+    Format: realuser@host:port  OR  realuser@http://host:port
     Examples:
-      - john@provider.com:8080 -> user=john, host=provider.com, port=8080
-      - john@provider.com      -> user=john, host=provider.com, port=80
-      - john                   -> ERROR (no provider specified)
+      - john@provider.com:8080        -> user=john, host=provider.com, port=8080
+      - john@http://provider.com:8080 -> user=john, host=provider.com, port=8080
+      - john@provider.com             -> user=john, host=provider.com, port=80
+      - john                          -> ERROR (no provider specified)
     """
     if '@' not in username:
         return None
@@ -69,6 +70,12 @@ def parse_credentials(username: str, password: str) -> dict:
     at_pos = username.rfind('@')
     real_user = username[:at_pos]
     host_part = username[at_pos + 1:]
+    
+    # Strip protocol if present (http:// or https://)
+    if host_part.startswith('http://'):
+        host_part = host_part[7:]
+    elif host_part.startswith('https://'):
+        host_part = host_part[8:]
     
     # Parse host:port
     if ':' in host_part:
@@ -332,6 +339,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_text('Cache cleared!')
             return
         
+        # === Live/VOD/Series streams - handle BEFORE query param check ===
+        # These have credentials in the path: /live/username/password/stream.ts
+        if path.startswith('/live/') or path.startswith('/movie/') or path.startswith('/series/'):
+            parts = path.split('/')
+            if len(parts) >= 5:
+                stream_type = parts[1]  # live, movie, or series
+                path_username = parts[2]  # user@host:port
+                path_password = parts[3]  # password
+                stream_path = '/'.join(parts[4:])  # stream ID and extension
+                
+                provider = parse_credentials(path_username, path_password)
+                if not provider:
+                    self.send_text('Invalid credentials in stream URL', 400)
+                    return
+                
+                real_url = (f"{provider['base_url']}/{stream_type}/"
+                           f"{provider['username']}/{provider['password']}/{stream_path}")
+                
+                logger.info(f"Stream: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
+                self.proxy_binary(real_url)
+                return
+        
         # === Extract credentials from request ===
         username = query.get('username', [None])[0]
         password = query.get('password', [None])[0]
@@ -408,6 +437,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     return
             
             try:
+                logger.info(f"Fetching from upstream: {real_url}")
                 raw = fetch_url(real_url).decode('utf-8')
                 
                 # Normalize stream names for relevant actions
@@ -430,28 +460,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 
                 self.send_json(raw)
                 
+            except HTTPError as e:
+                logger.error(f"Upstream HTTP error: {e.code} {e.reason} for {real_url}")
+                self.send_error_json(f"Upstream server returned {e.code}: {e.reason}")
+            except URLError as e:
+                logger.error(f"Upstream connection error: {e.reason} for {real_url}")
+                self.send_error_json(f"Cannot connect to upstream: {e.reason}")
             except Exception as e:
-                logger.error(f"API error: {e}")
+                logger.error(f"API error: {e} for {real_url}")
                 self.send_error_json(str(e))
             return
         
-        # === Live/VOD/Series streams - proxy directly ===
-        if path.startswith('/live/') or path.startswith('/movie/') or path.startswith('/series/'):
-            # Path format: /live/username/password/streamid.ts
-            # We need to replace username/password with real ones
-            parts = path.split('/')
-            if len(parts) >= 4:
-                stream_type = parts[1]  # live, movie, or series
-                # parts[2] is the proxy username (user@host:port)
-                # parts[3] is password
-                # rest is stream path
-                stream_path = '/'.join(parts[4:])
-                
-                real_url = (f"{provider['base_url']}/{stream_type}/"
-                           f"{provider['username']}/{provider['password']}/{stream_path}")
-                
-                self.proxy_binary(real_url)
-                return
         
         # === EPG/XMLTV ===
         if path == '/xmltv.php' or 'xmltv' in path.lower():
