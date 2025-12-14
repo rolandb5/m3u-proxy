@@ -140,9 +140,11 @@ def normalize_channel_name(name: str) -> str:
     name = re.sub(r'\s*-\s*NO EVENT STREAMING\s*-?\s*', ' ', name)
     name = re.sub(r'^:\s*', '', name)
     name = re.sub(r'\s*\|\s*$', '', name)
-    name = re.sub(r'\s+(HD|FHD|4K|8K|8K\+|UHD|SD|LQ|HEVC)\s*$', '', name, flags=re.IGNORECASE)
-    name = re.sub(r'\s+FHD\s+50FPS\s*$', '', name, flags=re.IGNORECASE)
+    # Remove quality suffixes - order matters: longer patterns first (8K+ before 8K)
     name = re.sub(r'\s+8K\+\s*UHD\s*$', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\s+8K\+\s*$', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\s+(HD|FHD|4K|8K|UHD|SD|LQ|HEVC)\s*$', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\s+FHD\s+50FPS\s*$', '', name, flags=re.IGNORECASE)
     
     # === PHASE 4: Normalize spacing for Dutch channels ===
     name = re.sub(r'^NPO(\d)', r'NPO \1', name, flags=re.IGNORECASE)
