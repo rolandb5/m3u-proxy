@@ -1,8 +1,6 @@
-version: '3.8'
-
 services:
   m3u-proxy:
-    build: .
+    image: ghcr.io/rolandb5/m3u-proxy:latest
     container_name: m3u-proxy
     restart: unless-stopped
     ports:
