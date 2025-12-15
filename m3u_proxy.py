@@ -158,10 +158,11 @@ def normalize_channel_name(name: str) -> str:
     
     # === PHASE 5: Add space before TV/LITE suffix when missing ===
     # OUTTV -> OUT TV, L1TV -> L1 TV, SLAM!TV -> SLAM! TV, TV538 -> TV 538
-    name = re.sub(r'([A-Za-z])TV$', r'\1 TV', name)  # letterTV -> letter TV
-    name = re.sub(r'([!?])TV$', r'\1 TV', name)       # punctuationTV -> punctuation TV
-    name = re.sub(r'(\d)TV$', r'\1 TV', name)         # numberTV -> number TV
-    name = re.sub(r'TV(\d)', r'TV \1', name)          # TV538 -> TV 538
+    # All rules are case-insensitive since input can be mixed case
+    name = re.sub(r'([A-Za-z])TV$', r'\1 TV', name, flags=re.IGNORECASE)  # letterTV -> letter TV
+    name = re.sub(r'([!?])TV$', r'\1 TV', name, flags=re.IGNORECASE)       # punctuationTV -> punctuation TV
+    name = re.sub(r'(\d)TV$', r'\1 TV', name, flags=re.IGNORECASE)         # numberTV -> number TV
+    name = re.sub(r'TV(\d)', r'TV \1', name, flags=re.IGNORECASE)          # TV538 -> TV 538
     # STINGRAYLITETV -> STINGRAY LITE TV
     name = re.sub(r'([A-Za-z])LITE\s*TV$', r'\1 LITE TV', name, flags=re.IGNORECASE)
     name = re.sub(r'([A-Za-z])LITE$', r'\1 LITE', name, flags=re.IGNORECASE)
