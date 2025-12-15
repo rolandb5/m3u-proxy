@@ -1,0 +1,59 @@
+# Stream-Mapparr Pagination Fix
+# 
+# Problem: NPO 2 (and potentially other streams) not being loaded because
+# they're at the end of the pagination and the last page check fails.
+#
+# Location: /data/plugins/stream-mapparr/plugin.py
+# Around line 2411-2428
+#
+# CURRENT CODE (buggy):
+# =====================
+                # Handle both paginated and non-paginated responses
+                if isinstance(streams_response, dict) and 'results' in streams_response:
+                    results = streams_response['results']
+
+                    # Check if we got empty results
+                    if not results:
+                        logger.debug("[Stream-Mapparr] Reached last page of streams (empty results)")
+                        break
+
+                    all_streams_data.extend(results)
+                    logger.debug(f"[Stream-Mapparr] Fetched page {page}: {len(results)} streams (total so far: {len(all_streams_data)})")
+
+                    # Stop if this page had fewer results than page_size (last page)
+                    if len(results) < 100:
+                        logger.debug("[Stream-Mapparr] Reached last page of streams")
+                        break
+
+                    page += 1
+
+# FIXED CODE:
+# ===========
+                # Handle both paginated and non-paginated responses
+                if isinstance(streams_response, dict) and 'results' in streams_response:
+                    results = streams_response['results']
+
+                    # Check if we got empty results
+                    if not results:
+                        logger.debug("[Stream-Mapparr] Reached last page of streams (empty results)")
+                        break
+
+                    all_streams_data.extend(results)
+                    logger.debug(f"[Stream-Mapparr] Fetched page {page}: {len(results)} streams (total so far: {len(all_streams_data)})")
+
+                    # Check if there's a next page using the 'next' field (more reliable)
+                    if not streams_response.get('next'):
+                        logger.debug("[Stream-Mapparr] Reached last page of streams (no next page)")
+                        break
+
+                    page += 1
+
+# ALTERNATIVE: Also add debug logging to see what's happening
+# Add this after line 2448 (after the while loop):
+# ==================================================
+            logger.info(f"[Stream-Mapparr] Total streams loaded: {len(all_streams_data)}")
+            
+            # Debug: Check if NPO streams are in the loaded data
+            npo_streams = [s for s in all_streams_data if 'NPO' in s.get('name', '')]
+            logger.info(f"[Stream-Mapparr] NPO streams found: {[s.get('name') for s in npo_streams]}")
+

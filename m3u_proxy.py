@@ -153,6 +153,10 @@ def normalize_channel_name(name: str) -> str:
     name = re.sub(r'^ESPN(\d)', r'ESPN \1', name, flags=re.IGNORECASE)
     name = re.sub(r'^RTL(\d)', r'RTL \1', name, flags=re.IGNORECASE)
     name = re.sub(r'^Film\s*1\s+', 'Film1 ', name, flags=re.IGNORECASE)
+    # Add space between numbers and letters for channels like "24KITCHEN" -> "24 KITCHEN"
+    name = re.sub(r'^(\d+)([A-Za-z])', r'\1 \2', name)
+    # Normalize "24 Kitchen" variants to "24 KITCHEN"
+    name = re.sub(r'^24\s*kitchen$', '24 KITCHEN', name, flags=re.IGNORECASE)
     
     # === PHASE 5: Final cleanup ===
     name = re.sub(r'\s{2,}', ' ', name)
