@@ -155,12 +155,40 @@ def normalize_channel_name(name: str) -> str:
     name = re.sub(r'^Film\s*1\s+', 'Film1 ', name, flags=re.IGNORECASE)
     # Add space between numbers and letters for channels like "24KITCHEN" -> "24 KITCHEN"
     name = re.sub(r'^(\d+)([A-Za-z])', r'\1 \2', name)
-    # Normalize "24 Kitchen" variants to "24 KITCHEN"
-    name = re.sub(r'^24\s*kitchen$', '24 KITCHEN', name, flags=re.IGNORECASE)
     
-    # === PHASE 5: Final cleanup ===
+    # === PHASE 5: Add space before TV/LITE suffix when missing ===
+    # OUTTV -> OUT TV, L1TV -> L1 TV, SLAM!TV -> SLAM! TV, TV538 -> TV 538
+    name = re.sub(r'([A-Za-z])TV$', r'\1 TV', name)  # letterTV -> letter TV
+    name = re.sub(r'([!?])TV$', r'\1 TV', name)       # punctuationTV -> punctuation TV
+    name = re.sub(r'(\d)TV$', r'\1 TV', name)         # numberTV -> number TV
+    name = re.sub(r'TV(\d)', r'TV \1', name)          # TV538 -> TV 538
+    # STINGRAYLITETV -> STINGRAY LITE TV
+    name = re.sub(r'([A-Za-z])LITE\s*TV$', r'\1 LITE TV', name, flags=re.IGNORECASE)
+    name = re.sub(r'([A-Za-z])LITE$', r'\1 LITE', name, flags=re.IGNORECASE)
+    
+    # === PHASE 6: Normalize special characters ===
+    # Convert accented characters to ASCII equivalents
+    name = name.replace('â', 'A').replace('Â', 'A')
+    name = name.replace('ê', 'E').replace('Ê', 'E')
+    name = name.replace('î', 'I').replace('Î', 'I')
+    name = name.replace('ô', 'O').replace('Ô', 'O')
+    name = name.replace('û', 'U').replace('Û', 'U')
+    name = name.replace('ë', 'E').replace('Ë', 'E')
+    name = name.replace('ï', 'I').replace('Ï', 'I')
+    name = name.replace('ü', 'U').replace('Ü', 'U')
+    name = name.replace('é', 'E').replace('É', 'E')
+    name = name.replace('è', 'E').replace('È', 'E')
+    name = name.replace('à', 'A').replace('À', 'A')
+    name = name.replace('ö', 'O').replace('Ö', 'O')
+    name = name.replace('ä', 'A').replace('Ä', 'A')
+    # Remove apostrophes from decade names: 80's -> 80S
+    name = re.sub(r"(\d+)'s", r'\1S', name, flags=re.IGNORECASE)
+    
+    # === PHASE 7: Final cleanup and UPPERCASE ===
     name = re.sub(r'\s{2,}', ' ', name)
     name = name.strip()
+    # Convert everything to UPPERCASE for consistency
+    name = name.upper()
     
     return name
 
