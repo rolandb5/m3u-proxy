@@ -28,6 +28,7 @@ import json
 import time
 import hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlparse, parse_qs, urlencode
@@ -46,6 +47,88 @@ CACHE_HOURS = float(os.environ.get('CACHE_HOURS', 6))
 
 # In-memory cache: key -> {'content': ..., 'timestamp': ...}
 cache = {}
+
+
+# =============================================================================
+# PRE-COMPILED REGEX PATTERNS (for performance)
+# =============================================================================
+
+# Phase 1: Provider wrappers
+RE_WRAPPER = re.compile(r'┃[^┃]+┃\s*')
+RE_NL_COLON = re.compile(r'^NL:\s*')
+RE_NL_PIPE = re.compile(r'^NL\|\s*')
+RE_UK_PIPE = re.compile(r'^UK\|\s*')
+RE_PLAY_PLUS = re.compile(r'^PLAY\+:\s*')
+RE_OD = re.compile(r'^OD:\s*')
+
+# Phase 2: Special Unicode characters
+RE_VIP = re.compile(r'\s*ⱽᴵᴾ\s*')
+RE_RAW = re.compile(r'\s*ᴿᴬᵂ\s*')
+RE_HD_SUPER = re.compile(r'\s*ᴴᴰ\s*')
+RE_UHD_SUPER = re.compile(r'\s*ᵁᴴᴰ\s*')
+RE_GOLD = re.compile(r'\s*ᴳᴼᴸᴰ\s*')
+RE_REC = re.compile(r'\s*⏺ʳᵉᶜ\s*')
+RE_CIRCLE = re.compile(r'\s*◉\s*')
+RE_UHD_3840 = re.compile(r'\s*ᵁᴴᴰ\s*³⁸⁴⁰ᴾ\s*')
+RE_BARS = re.compile(r'☰+\s*|\s*☰+')
+RE_TRIPLE = re.compile(r'≡+\s*|\s*≡+')
+
+# Phase 3: Quality/format tags
+RE_8K_EXCLUSIVE = re.compile(r'\s*\|\s*8K\s*EXCLUSIVE\s*')
+RE_NO_EVENT = re.compile(r'\s*-\s*NO EVENT STREAMING\s*-?\s*')
+RE_COLON_START = re.compile(r'^:\s*')
+RE_PIPE_END = re.compile(r'\s*\|\s*$')
+RE_8K_PLUS_UHD = re.compile(r'\s+8K\+\s*UHD\s*$', re.IGNORECASE)
+RE_8K_PLUS = re.compile(r'\s+8K\+\s*$', re.IGNORECASE)
+RE_QUALITY = re.compile(r'\s+(HD|FHD|4K|8K|UHD|SD|LQ|HEVC)\s*$', re.IGNORECASE)
+RE_FHD_50FPS = re.compile(r'\s+FHD\s+50FPS\s*$', re.IGNORECASE)
+
+# Phase 4: Dutch channel spacing
+RE_NPO = re.compile(r'^NPO(\d)', re.IGNORECASE)
+RE_SBS = re.compile(r'^SBS(\d)', re.IGNORECASE)
+RE_NET5 = re.compile(r'^Net\s*5$', re.IGNORECASE)
+RE_ESPN = re.compile(r'^ESPN(\d)', re.IGNORECASE)
+RE_RTL = re.compile(r'^RTL(\d)', re.IGNORECASE)
+RE_FILM1 = re.compile(r'^Film\s*1\s+', re.IGNORECASE)
+RE_NUM_LETTER = re.compile(r'^(\d+)([A-Za-z])')
+
+# Phase 5: TV/LITE suffix spacing
+RE_LETTER_TV = re.compile(r'([A-Za-z])TV$', re.IGNORECASE)
+RE_PUNCT_TV = re.compile(r'([!?])TV$', re.IGNORECASE)
+RE_NUM_TV = re.compile(r'(\d)TV$', re.IGNORECASE)
+RE_TV_NUM = re.compile(r'TV(\d)', re.IGNORECASE)
+RE_LITE_TV = re.compile(r'([A-Za-z])LITE\s*TV$', re.IGNORECASE)
+RE_LITE = re.compile(r'([A-Za-z])LITE$', re.IGNORECASE)
+
+# Phase 6: Decade apostrophes
+RE_DECADE = re.compile(r"(\d+)'s", re.IGNORECASE)
+
+# Phase 7: Multi-space cleanup
+RE_MULTI_SPACE = re.compile(r'\s{2,}')
+
+# Event detection patterns
+RE_EVENT_DATE = re.compile(r'@\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d', re.IGNORECASE)
+RE_F1_PREFIX = re.compile(r'^F1:', re.IGNORECASE)
+RE_VIAPLAY_F = re.compile(r'VIAPLAY\s+F[123]', re.IGNORECASE)
+RE_SPORT_EVENT = re.compile(r'^[A-Za-z\s\-]+:\s+.+@')
+
+# Skip channel patterns
+RE_HASH_HEADER = re.compile(r'^#{2,}.*#{2,}$')
+RE_BAR_HEADER = re.compile(r'^☰+.*☰+$')
+RE_TRIPLE_HEADER = re.compile(r'^≡+.*≡+$')
+RE_DASH_LINE = re.compile(r'^-+$')
+
+# M3U processing
+RE_TVG_NAME = re.compile(r'tvg-name="([^"]*)"')
+
+# Accent translation table (much faster than multiple replace() calls)
+ACCENT_TABLE = str.maketrans({
+    'â': 'A', 'Â': 'A', 'ê': 'E', 'Ê': 'E', 'î': 'I', 'Î': 'I',
+    'ô': 'O', 'Ô': 'O', 'û': 'U', 'Û': 'U', 'ë': 'E', 'Ë': 'E',
+    'ï': 'I', 'Ï': 'I', 'ü': 'U', 'Ü': 'U', 'é': 'E', 'É': 'E',
+    'è': 'E', 'È': 'E', 'à': 'A', 'À': 'A', 'ö': 'O', 'Ö': 'O',
+    'ä': 'A', 'Ä': 'A'
+})
 
 
 # =============================================================================
@@ -105,6 +188,7 @@ def normalize_channel_name(name: str) -> str:
     """
     Apply all normalization rules to a channel name.
     Event/PPV/F1 channels are returned unchanged to preserve event info.
+    Uses pre-compiled regex patterns for performance.
     """
     if not name:
         return name
@@ -113,98 +197,78 @@ def normalize_channel_name(name: str) -> str:
     if is_event_channel(name):
         return name
     
-    original = name
-    
     # === PHASE 1: Remove provider wrappers ===
-    name = re.sub(r'┃[^┃]+┃\s*', '', name)
-    name = re.sub(r'^NL:\s*', '', name)
-    name = re.sub(r'^NL\|\s*', '', name)
-    name = re.sub(r'^UK\|\s*', '', name)
-    name = re.sub(r'^PLAY\+:\s*', '', name)
-    name = re.sub(r'^OD:\s*', '', name)
+    name = RE_WRAPPER.sub('', name)
+    name = RE_NL_COLON.sub('', name)
+    name = RE_NL_PIPE.sub('', name)
+    name = RE_UK_PIPE.sub('', name)
+    name = RE_PLAY_PLUS.sub('', name)
+    name = RE_OD.sub('', name)
     
     # === PHASE 2: Remove special Unicode characters ===
-    name = re.sub(r'\s*ⱽᴵᴾ\s*', '', name)
-    name = re.sub(r'\s*ᴿᴬᵂ\s*', '', name)
-    name = re.sub(r'\s*ᴴᴰ\s*', '', name)
-    name = re.sub(r'\s*ᵁᴴᴰ\s*', '', name)
-    name = re.sub(r'\s*ᴳᴼᴸᴰ\s*', '', name)
-    name = re.sub(r'\s*⏺ʳᵉᶜ\s*', '', name)
-    name = re.sub(r'\s*◉\s*', '', name)
-    name = re.sub(r'\s*ᵁᴴᴰ\s*³⁸⁴⁰ᴾ\s*', '', name)
-    name = re.sub(r'☰+\s*|\s*☰+', '', name)
-    name = re.sub(r'≡+\s*|\s*≡+', '', name)
+    name = RE_VIP.sub('', name)
+    name = RE_RAW.sub('', name)
+    name = RE_HD_SUPER.sub('', name)
+    name = RE_UHD_SUPER.sub('', name)
+    name = RE_GOLD.sub('', name)
+    name = RE_REC.sub('', name)
+    name = RE_CIRCLE.sub('', name)
+    name = RE_UHD_3840.sub('', name)
+    name = RE_BARS.sub('', name)
+    name = RE_TRIPLE.sub('', name)
     
     # === PHASE 3: Remove quality/format tags ===
-    name = re.sub(r'\s*\|\s*8K\s*EXCLUSIVE\s*', '', name)
-    name = re.sub(r'\s*-\s*NO EVENT STREAMING\s*-?\s*', ' ', name)
-    name = re.sub(r'^:\s*', '', name)
-    name = re.sub(r'\s*\|\s*$', '', name)
-    # Remove quality suffixes - order matters: longer patterns first (8K+ before 8K)
-    name = re.sub(r'\s+8K\+\s*UHD\s*$', '', name, flags=re.IGNORECASE)
-    name = re.sub(r'\s+8K\+\s*$', '', name, flags=re.IGNORECASE)
-    name = re.sub(r'\s+(HD|FHD|4K|8K|UHD|SD|LQ|HEVC)\s*$', '', name, flags=re.IGNORECASE)
-    name = re.sub(r'\s+FHD\s+50FPS\s*$', '', name, flags=re.IGNORECASE)
+    name = RE_8K_EXCLUSIVE.sub('', name)
+    name = RE_NO_EVENT.sub(' ', name)
+    name = RE_COLON_START.sub('', name)
+    name = RE_PIPE_END.sub('', name)
+    # Remove quality suffixes - order matters: longer patterns first
+    name = RE_8K_PLUS_UHD.sub('', name)
+    name = RE_8K_PLUS.sub('', name)
+    name = RE_QUALITY.sub('', name)
+    name = RE_FHD_50FPS.sub('', name)
     
     # === PHASE 4: Normalize spacing for Dutch channels ===
-    name = re.sub(r'^NPO(\d)', r'NPO \1', name, flags=re.IGNORECASE)
-    name = re.sub(r'^SBS(\d)', r'SBS \1', name, flags=re.IGNORECASE)
-    name = re.sub(r'^Net\s*5$', 'NET 5', name, flags=re.IGNORECASE)
-    name = re.sub(r'^ESPN(\d)', r'ESPN \1', name, flags=re.IGNORECASE)
-    name = re.sub(r'^RTL(\d)', r'RTL \1', name, flags=re.IGNORECASE)
-    name = re.sub(r'^Film\s*1\s+', 'Film1 ', name, flags=re.IGNORECASE)
-    # Add space between numbers and letters for channels like "24KITCHEN" -> "24 KITCHEN"
-    name = re.sub(r'^(\d+)([A-Za-z])', r'\1 \2', name)
+    name = RE_NPO.sub(r'NPO \1', name)
+    name = RE_SBS.sub(r'SBS \1', name)
+    name = RE_NET5.sub('NET 5', name)
+    name = RE_ESPN.sub(r'ESPN \1', name)
+    name = RE_RTL.sub(r'RTL \1', name)
+    name = RE_FILM1.sub('Film1 ', name)
+    name = RE_NUM_LETTER.sub(r'\1 \2', name)
     
     # === PHASE 5: Add space before TV/LITE suffix when missing ===
-    # OUTTV -> OUT TV, L1TV -> L1 TV, SLAM!TV -> SLAM! TV, TV538 -> TV 538
-    # All rules are case-insensitive since input can be mixed case
-    name = re.sub(r'([A-Za-z])TV$', r'\1 TV', name, flags=re.IGNORECASE)  # letterTV -> letter TV
-    name = re.sub(r'([!?])TV$', r'\1 TV', name, flags=re.IGNORECASE)       # punctuationTV -> punctuation TV
-    name = re.sub(r'(\d)TV$', r'\1 TV', name, flags=re.IGNORECASE)         # numberTV -> number TV
-    name = re.sub(r'TV(\d)', r'TV \1', name, flags=re.IGNORECASE)          # TV538 -> TV 538
-    # STINGRAYLITETV -> STINGRAY LITE TV
-    name = re.sub(r'([A-Za-z])LITE\s*TV$', r'\1 LITE TV', name, flags=re.IGNORECASE)
-    name = re.sub(r'([A-Za-z])LITE$', r'\1 LITE', name, flags=re.IGNORECASE)
+    name = RE_LETTER_TV.sub(r'\1 TV', name)
+    name = RE_PUNCT_TV.sub(r'\1 TV', name)
+    name = RE_NUM_TV.sub(r'\1 TV', name)
+    name = RE_TV_NUM.sub(r'TV \1', name)
+    name = RE_LITE_TV.sub(r'\1 LITE TV', name)
+    name = RE_LITE.sub(r'\1 LITE', name)
     
     # === PHASE 6: Normalize special characters ===
-    # Convert accented characters to ASCII equivalents
-    name = name.replace('â', 'A').replace('Â', 'A')
-    name = name.replace('ê', 'E').replace('Ê', 'E')
-    name = name.replace('î', 'I').replace('Î', 'I')
-    name = name.replace('ô', 'O').replace('Ô', 'O')
-    name = name.replace('û', 'U').replace('Û', 'U')
-    name = name.replace('ë', 'E').replace('Ë', 'E')
-    name = name.replace('ï', 'I').replace('Ï', 'I')
-    name = name.replace('ü', 'U').replace('Ü', 'U')
-    name = name.replace('é', 'E').replace('É', 'E')
-    name = name.replace('è', 'E').replace('È', 'E')
-    name = name.replace('à', 'A').replace('À', 'A')
-    name = name.replace('ö', 'O').replace('Ö', 'O')
-    name = name.replace('ä', 'A').replace('Ä', 'A')
+    # Convert accented characters to ASCII equivalents (using translate for speed)
+    name = name.translate(ACCENT_TABLE)
     # Remove apostrophes from decade names: 80's -> 80S
-    name = re.sub(r"(\d+)'s", r'\1S', name, flags=re.IGNORECASE)
+    name = RE_DECADE.sub(r'\1S', name)
     
     # === PHASE 7: Final cleanup and UPPERCASE ===
-    name = re.sub(r'\s{2,}', ' ', name)
-    name = name.strip()
-    # Convert everything to UPPERCASE for consistency
-    name = name.upper()
+    name = RE_MULTI_SPACE.sub(' ', name)
+    name = name.strip().upper()
     
     return name
 
 
 def should_skip_channel(name: str) -> bool:
-    """Check if this is a header/placeholder."""
+    """Check if this is a header/placeholder. Uses pre-compiled patterns."""
     if not name:
         return True
-    if re.match(r'^#{2,}.*#{2,}$', name):
+    if RE_HASH_HEADER.match(name):
         return True
-    if re.match(r'^☰+.*☰+$', name):
+    if RE_BAR_HEADER.match(name):
         return True
-    if re.match(r'^≡+.*≡+$', name):
+    if RE_TRIPLE_HEADER.match(name):
         return True
-    if re.match(r'^-+$', name):
+    if RE_DASH_LINE.match(name):
         return True
     return False
 
@@ -212,24 +276,17 @@ def should_skip_channel(name: str) -> bool:
 def is_event_channel(name: str) -> bool:
     """
     Check if this is an event/PPV/F1 channel that should NOT be normalized.
-    These channels have useful event info in their names that we want to preserve.
-    
-    Covers:
-    - F1 driver feeds (UK| FORMULA 1 PPV)
-    - F1 TV channels (┃NL┃ F1 TV PRO)
-    - VIAPLAY F1/F2/F3 replays
-    - Event streams with dates (NL| VIAPLAY PPV, NL| MAX PPV, etc.)
-    - MotoGP content
+    Uses pre-compiled patterns for performance.
     """
     if not name:
         return False
     
     # Event channels with date/time patterns like "@ Dec 13 09:10 AM"
-    if re.search(r'@\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d', name, re.IGNORECASE):
+    if RE_EVENT_DATE.search(name):
         return True
     
     # F1 driver/feed channels (UK source) - pattern: "F1: DRIVER [TEAM]"
-    if re.match(r'^F1:', name, re.IGNORECASE):
+    if RE_F1_PREFIX.match(name):
         return True
     
     # F1 TV channels (NL source) - pattern: "┃F1 TV┃ ..."
@@ -237,19 +294,17 @@ def is_event_channel(name: str) -> bool:
         return True
     
     # VIAPLAY F1/F2/F3 content (replays, seasons)
-    if re.search(r'VIAPLAY\s+F[123]', name, re.IGNORECASE):
+    if RE_VIAPLAY_F.search(name):
         return True
     
     # FORMULE (Dutch for Formula) - catches "VIAPLAY FORMULE 1"
-    if 'FORMULE' in name.upper():
-        return True
-    
-    # MotoGP channels
-    if 'MOTOGP' in name.upper():
+    # MOTOGP channels - use upper() once and check both
+    name_upper = name.upper()
+    if 'FORMULE' in name_upper or 'MOTOGP' in name_upper:
         return True
     
     # Sport event pattern "Sport: Event @ Date" (catches scheduled events)
-    if re.match(r'^[A-Za-z\s\-]+:\s+.+@', name):
+    if RE_SPORT_EVENT.match(name):
         return True
     
     return False
@@ -309,12 +364,13 @@ def process_streams_json(data: list) -> list:
 
 
 def process_m3u(content: str) -> str:
-    """Normalize M3U playlist."""
+    """Normalize M3U playlist. Uses pre-compiled patterns for performance."""
     lines = content.split('\n')
     output = []
     i = 0
+    num_lines = len(lines)
     
-    while i < len(lines):
+    while i < num_lines:
         line = lines[i]
         
         if line.startswith('#EXTINF:'):
@@ -328,8 +384,7 @@ def process_m3u(content: str) -> str:
                     continue
                 
                 name = normalize_channel_name(name)
-                prefix = re.sub(
-                    r'tvg-name="([^"]*)"',
+                prefix = RE_TVG_NAME.sub(
                     lambda m: f'tvg-name="{normalize_channel_name(m.group(1))}"',
                     prefix
                 )
@@ -600,14 +655,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 # =============================================================================
+# THREADED HTTP SERVER
+# =============================================================================
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in separate threads for better performance."""
+    daemon_threads = True  # Don't wait for threads on shutdown
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
 def run_server():
-    server = HTTPServer(('0.0.0.0', PORT), ProxyHandler)
+    server = ThreadedHTTPServer(('0.0.0.0', PORT), ProxyHandler)
     
     logger.info("=" * 60)
-    logger.info("Xtream Codes Normalizing Proxy")
+    logger.info("Xtream Codes Normalizing Proxy (Multi-threaded)")
     logger.info("=" * 60)
     logger.info("")
     logger.info("NO CONFIGURATION NEEDED!")
