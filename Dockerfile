@@ -2,11 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY m3u_proxy.py .
+# Install dependencies first (better caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# No dependencies needed - uses only standard library!
+COPY m3u_proxy.py .
 
 EXPOSE 8765
 
+# Use uvicorn directly for better control
 CMD ["python", "m3u_proxy.py"]
-
