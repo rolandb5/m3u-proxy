@@ -37,6 +37,11 @@ import asyncio
 from functools import lru_cache
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List
+from datetime import datetime
+import statistics
 import logging
 
 import aiohttp
@@ -61,6 +66,189 @@ cache = {}
 
 # Global aiohttp session (connection pooling)
 http_session: aiohttp.ClientSession = None
+
+
+# =============================================================================
+# PERFORMANCE MONITORING
+# =============================================================================
+
+@dataclass
+class EndpointStats:
+    """Statistics for a single endpoint."""
+    requests: int = 0
+    errors: int = 0
+    response_times: List[float] = field(default_factory=list)
+    bytes_sent: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    last_request: float = 0
+    
+    def record_request(self, duration_ms: float, bytes_sent: int = 0, error: bool = False, cache_hit: bool = False):
+        self.requests += 1
+        self.last_request = time.time()
+        self.bytes_sent += bytes_sent
+        if error:
+            self.errors += 1
+        if cache_hit:
+            self.cache_hits += 1
+        else:
+            self.cache_misses += 1
+        # Keep last 1000 response times for percentile calculations
+        self.response_times.append(duration_ms)
+        if len(self.response_times) > 1000:
+            self.response_times = self.response_times[-1000:]
+    
+    def get_percentile(self, p: int) -> float:
+        if not self.response_times:
+            return 0
+        sorted_times = sorted(self.response_times)
+        idx = int(len(sorted_times) * p / 100)
+        return sorted_times[min(idx, len(sorted_times) - 1)]
+    
+    def to_dict(self) -> dict:
+        return {
+            'requests': self.requests,
+            'errors': self.errors,
+            'error_rate': f"{(self.errors / self.requests * 100):.1f}%" if self.requests > 0 else "0%",
+            'cache_hit_rate': f"{(self.cache_hits / self.requests * 100):.1f}%" if self.requests > 0 else "0%",
+            'bytes_sent': self.bytes_sent,
+            'bytes_sent_human': format_bytes(self.bytes_sent),
+            'response_time_ms': {
+                'avg': round(statistics.mean(self.response_times), 1) if self.response_times else 0,
+                'min': round(min(self.response_times), 1) if self.response_times else 0,
+                'max': round(max(self.response_times), 1) if self.response_times else 0,
+                'p50': round(self.get_percentile(50), 1),
+                'p95': round(self.get_percentile(95), 1),
+                'p99': round(self.get_percentile(99), 1),
+            },
+            'last_request': datetime.fromtimestamp(self.last_request).isoformat() if self.last_request else None
+        }
+
+
+class PerformanceMonitor:
+    """Tracks performance metrics for the proxy."""
+    
+    def __init__(self):
+        self.start_time = time.time()
+        self.endpoints: Dict[str, EndpointStats] = defaultdict(EndpointStats)
+        self.upstream_times: List[float] = []
+        self.total_upstream_requests = 0
+        self.total_upstream_errors = 0
+        self.active_requests = 0
+        self.peak_active_requests = 0
+    
+    def record_request(self, endpoint: str, duration_ms: float, bytes_sent: int = 0, 
+                       error: bool = False, cache_hit: bool = False):
+        self.endpoints[endpoint].record_request(duration_ms, bytes_sent, error, cache_hit)
+    
+    def record_upstream(self, duration_ms: float, error: bool = False):
+        self.total_upstream_requests += 1
+        if error:
+            self.total_upstream_errors += 1
+        self.upstream_times.append(duration_ms)
+        if len(self.upstream_times) > 1000:
+            self.upstream_times = self.upstream_times[-1000:]
+    
+    def request_started(self):
+        self.active_requests += 1
+        self.peak_active_requests = max(self.peak_active_requests, self.active_requests)
+    
+    def request_finished(self):
+        self.active_requests = max(0, self.active_requests - 1)
+    
+    def get_upstream_percentile(self, p: int) -> float:
+        if not self.upstream_times:
+            return 0
+        sorted_times = sorted(self.upstream_times)
+        idx = int(len(sorted_times) * p / 100)
+        return sorted_times[min(idx, len(sorted_times) - 1)]
+    
+    def get_stats(self) -> dict:
+        uptime_seconds = time.time() - self.start_time
+        total_requests = sum(e.requests for e in self.endpoints.values())
+        total_errors = sum(e.errors for e in self.endpoints.values())
+        total_bytes = sum(e.bytes_sent for e in self.endpoints.values())
+        
+        # Get LRU cache stats
+        norm_cache = normalize_channel_name.cache_info()
+        event_cache = is_event_channel.cache_info()
+        
+        return {
+            'uptime': format_duration(uptime_seconds),
+            'uptime_seconds': round(uptime_seconds, 1),
+            'active_requests': self.active_requests,
+            'peak_active_requests': self.peak_active_requests,
+            'totals': {
+                'requests': total_requests,
+                'errors': total_errors,
+                'error_rate': f"{(total_errors / total_requests * 100):.1f}%" if total_requests > 0 else "0%",
+                'bytes_sent': total_bytes,
+                'bytes_sent_human': format_bytes(total_bytes),
+                'requests_per_minute': round(total_requests / (uptime_seconds / 60), 2) if uptime_seconds > 0 else 0,
+            },
+            'upstream': {
+                'requests': self.total_upstream_requests,
+                'errors': self.total_upstream_errors,
+                'error_rate': f"{(self.total_upstream_errors / self.total_upstream_requests * 100):.1f}%" if self.total_upstream_requests > 0 else "0%",
+                'response_time_ms': {
+                    'avg': round(statistics.mean(self.upstream_times), 1) if self.upstream_times else 0,
+                    'min': round(min(self.upstream_times), 1) if self.upstream_times else 0,
+                    'max': round(max(self.upstream_times), 1) if self.upstream_times else 0,
+                    'p50': round(self.get_upstream_percentile(50), 1),
+                    'p95': round(self.get_upstream_percentile(95), 1),
+                    'p99': round(self.get_upstream_percentile(99), 1),
+                }
+            },
+            'caches': {
+                'response_cache': {
+                    'entries': len(cache),
+                    'max_age_hours': CACHE_HOURS
+                },
+                'normalization_cache': {
+                    'hits': norm_cache.hits,
+                    'misses': norm_cache.misses,
+                    'size': norm_cache.currsize,
+                    'max_size': norm_cache.maxsize,
+                    'hit_rate': f"{(norm_cache.hits / (norm_cache.hits + norm_cache.misses) * 100):.1f}%" if (norm_cache.hits + norm_cache.misses) > 0 else "0%"
+                },
+                'event_detection_cache': {
+                    'hits': event_cache.hits,
+                    'misses': event_cache.misses,
+                    'size': event_cache.currsize,
+                    'hit_rate': f"{(event_cache.hits / (event_cache.hits + event_cache.misses) * 100):.1f}%" if (event_cache.hits + event_cache.misses) > 0 else "0%"
+                }
+            },
+            'endpoints': {name: stats.to_dict() for name, stats in sorted(self.endpoints.items())}
+        }
+
+
+def format_bytes(b: int) -> str:
+    """Format bytes as human readable."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} TB"
+
+
+def format_duration(seconds: float) -> str:
+    """Format seconds as human readable duration."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds // 60:.0f}m {seconds % 60:.0f}s"
+    elif seconds < 86400:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        return f"{hours:.0f}h {minutes:.0f}m"
+    else:
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+        return f"{days:.0f}d {hours:.0f}h"
+
+
+# Global performance monitor
+perf = PerformanceMonitor()
 
 
 # =============================================================================
@@ -301,19 +489,37 @@ def is_event_channel(name: str) -> bool:
 
 
 # =============================================================================
-# ASYNC HTTP HELPERS
+# ASYNC HTTP HELPERS (with performance tracking)
 # =============================================================================
 
 async def fetch_url(url: str, timeout: int = 60) -> bytes:
-    """Fetch a URL using connection-pooled session."""
-    async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-        return await response.read()
+    """Fetch a URL using connection-pooled session. Tracks upstream timing."""
+    start = time.time()
+    error = False
+    try:
+        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+            return await response.read()
+    except Exception:
+        error = True
+        raise
+    finally:
+        duration_ms = (time.time() - start) * 1000
+        perf.record_upstream(duration_ms, error=error)
 
 
 async def fetch_url_text(url: str, timeout: int = 60) -> str:
-    """Fetch a URL and return text."""
-    async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-        return await response.text()
+    """Fetch a URL and return text. Tracks upstream timing."""
+    start = time.time()
+    error = False
+    try:
+        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+            return await response.text()
+    except Exception:
+        error = True
+        raise
+    finally:
+        duration_ms = (time.time() - start) * 1000
+        perf.record_upstream(duration_ms, error=error)
 
 
 def get_cache_key(provider: dict, endpoint: str, params: dict = None) -> str:
@@ -420,9 +626,17 @@ async def lifespan(app: FastAPI):
     logger.info("  ✓ Connection pooling (reuses upstream connections)")
     logger.info("  ✓ Gzip compression (smaller responses)")
     logger.info("  ✓ LRU cache for normalized names")
+    logger.info("  ✓ Performance monitoring (/stats, /metrics)")
     logger.info("")
     logger.info(f"Server running on port {PORT}")
     logger.info(f"Cache duration: {CACHE_HOURS} hours")
+    logger.info("")
+    logger.info("Monitoring endpoints:")
+    logger.info(f"  http://localhost:{PORT}/health  - Health check")
+    logger.info(f"  http://localhost:{PORT}/stats   - Performance stats (JSON)")
+    logger.info(f"  http://localhost:{PORT}/metrics - Prometheus metrics")
+    logger.info(f"  http://localhost:{PORT}/cache   - Cache details")
+    logger.info(f"  http://localhost:{PORT}/clear   - Clear all caches")
     logger.info("=" * 60)
     
     yield
@@ -437,10 +651,111 @@ app = FastAPI(title="M3U Normalizing Proxy", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
+@app.middleware("http")
+async def performance_middleware(request: Request, call_next):
+    """Track request timing and stats for all endpoints."""
+    # Skip stats/health to avoid recursion
+    if request.url.path in ['/stats', '/health', '/metrics']:
+        return await call_next(request)
+    
+    perf.request_started()
+    start_time = time.time()
+    error = False
+    response = None
+    
+    try:
+        response = await call_next(request)
+        if response.status_code >= 400:
+            error = True
+        return response
+    except Exception as e:
+        error = True
+        raise
+    finally:
+        perf.request_finished()
+        duration_ms = (time.time() - start_time) * 1000
+        
+        # Determine endpoint name
+        path = request.url.path
+        if path.startswith('/live/'):
+            endpoint = '/live/*'
+        elif path.startswith('/movie/'):
+            endpoint = '/movie/*'
+        elif path.startswith('/series/'):
+            endpoint = '/series/*'
+        else:
+            endpoint = path
+        
+        # Get response size if available
+        content_length = 0
+        if response and hasattr(response, 'headers'):
+            content_length = int(response.headers.get('content-length', 0))
+        
+        # Check if it was a cache hit (indicated by fast response < 5ms without upstream)
+        cache_hit = duration_ms < 5 and endpoint in ['/get.php', '/playlist.m3u', '/', '/player_api.php']
+        
+        perf.record_request(endpoint, duration_ms, content_length, error, cache_hit)
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
     return PlainTextResponse("OK")
+
+
+@app.get("/stats")
+async def get_stats():
+    """Get comprehensive performance statistics."""
+    return JSONResponse(perf.get_stats())
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Prometheus-compatible metrics endpoint."""
+    stats = perf.get_stats()
+    lines = [
+        "# HELP m3u_proxy_uptime_seconds Proxy uptime in seconds",
+        "# TYPE m3u_proxy_uptime_seconds gauge",
+        f"m3u_proxy_uptime_seconds {stats['uptime_seconds']}",
+        "",
+        "# HELP m3u_proxy_requests_total Total requests by endpoint",
+        "# TYPE m3u_proxy_requests_total counter",
+    ]
+    
+    for endpoint, data in stats['endpoints'].items():
+        safe_endpoint = endpoint.replace('/', '_').replace('*', 'all').strip('_')
+        lines.append(f'm3u_proxy_requests_total{{endpoint="{safe_endpoint}"}} {data["requests"]}')
+    
+    lines.extend([
+        "",
+        "# HELP m3u_proxy_errors_total Total errors by endpoint",
+        "# TYPE m3u_proxy_errors_total counter",
+    ])
+    
+    for endpoint, data in stats['endpoints'].items():
+        safe_endpoint = endpoint.replace('/', '_').replace('*', 'all').strip('_')
+        lines.append(f'm3u_proxy_errors_total{{endpoint="{safe_endpoint}"}} {data["errors"]}')
+    
+    lines.extend([
+        "",
+        "# HELP m3u_proxy_active_requests Current active requests",
+        "# TYPE m3u_proxy_active_requests gauge",
+        f"m3u_proxy_active_requests {stats['active_requests']}",
+        "",
+        "# HELP m3u_proxy_upstream_requests_total Total upstream requests",
+        "# TYPE m3u_proxy_upstream_requests_total counter",
+        f"m3u_proxy_upstream_requests_total {stats['upstream']['requests']}",
+        "",
+        "# HELP m3u_proxy_cache_hit_ratio Normalization cache hit ratio",
+        "# TYPE m3u_proxy_cache_hit_ratio gauge",
+    ])
+    
+    norm_cache = stats['caches']['normalization_cache']
+    total = norm_cache['hits'] + norm_cache['misses']
+    hit_ratio = norm_cache['hits'] / total if total > 0 else 0
+    lines.append(f"m3u_proxy_cache_hit_ratio {hit_ratio:.4f}")
+    
+    return PlainTextResponse("\n".join(lines), media_type="text/plain")
 
 
 @app.get("/cache")
