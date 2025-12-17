@@ -552,7 +552,8 @@ async def player_api(request: Request, username: str = None, password: str = Non
     real_url = f"{provider['base_url']}/player_api.php?{urlencode(real_params)}"
     cache_key = get_cache_key(provider, 'api', real_params)
     
-    normalize_actions = ['get_live_streams', 'get_vod_streams', 'get_series']
+    # Only normalize live IPTV streams, not VOD/Series (titles need different handling)
+    normalize_actions = ['get_live_streams']
     no_cache_actions = ['get_short_epg', 'get_simple_data_table']
     
     # Check cache
