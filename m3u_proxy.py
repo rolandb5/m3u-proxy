@@ -788,7 +788,7 @@ async def clear_cache():
 @app.get("/movie/{username}/{password}/{stream_path:path}")
 @app.get("/series/{username}/{password}/{stream_path:path}")
 async def proxy_stream(username: str, password: str, stream_path: str, request: Request):
-    """Proxy live/VOD/series streams."""
+    """Proxy live/VOD/series streams with proper header forwarding."""
     stream_type = request.url.path.split('/')[1]
     
     provider = parse_credentials(username, password)
@@ -799,12 +799,40 @@ async def proxy_stream(username: str, password: str, stream_path: str, request: 
     
     logger.info(f"Stream: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
     
-    async def stream_response():
-        async with http_session.get(real_url) as response:
-            async for chunk in response.content.iter_chunked(65536):
-                yield chunk
-    
-    return StreamingResponse(stream_response(), media_type="application/octet-stream")
+    try:
+        # Make the upstream request and keep it open for streaming
+        upstream_response = await http_session.get(real_url)
+        
+        # Get content type from upstream (important for video players)
+        content_type = upstream_response.headers.get('Content-Type', 'video/mp2t')
+        content_length = upstream_response.headers.get('Content-Length')
+        
+        # Build response headers
+        headers = {}
+        if content_length:
+            headers['Content-Length'] = content_length
+        
+        # Forward relevant headers from upstream
+        for header in ['Accept-Ranges', 'Content-Range']:
+            if header in upstream_response.headers:
+                headers[header] = upstream_response.headers[header]
+        
+        async def stream_generator():
+            try:
+                async for chunk in upstream_response.content.iter_chunked(65536):
+                    yield chunk
+            finally:
+                upstream_response.close()
+        
+        return StreamingResponse(
+            stream_generator(),
+            status_code=upstream_response.status,
+            media_type=content_type,
+            headers=headers
+        )
+    except aiohttp.ClientError as e:
+        logger.error(f"Stream proxy error: {e}")
+        return PlainTextResponse(f"Upstream error: {e}", status_code=502)
 
 
 @app.get("/get.php")
