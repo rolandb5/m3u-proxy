@@ -48,6 +48,7 @@ import aiohttp
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # Configure logging
@@ -740,6 +741,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="M3U Normalizing Proxy", lifespan=lifespan)
+
+# Add CORS middleware (allow Dispatcharr web interface to access streams)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods (GET, HEAD, OPTIONS, etc.)
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Type"],
+)
 
 # Add Gzip compression (min 500 bytes)
 app.add_middleware(GZipMiddleware, minimum_size=500)
