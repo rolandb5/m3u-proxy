@@ -894,22 +894,27 @@ async def proxy_stream_head(username: str, password: str, stream_path: str, requ
     logger.info(f"Stream HEAD: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
     
     try:
-        # Do a HEAD request to upstream
+        # Try HEAD request first
         async with http_session.head(real_url, allow_redirects=True) as upstream_response:
-            headers = {}
-            
-            # Forward important headers
-            for header in ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Content-Range']:
-                if header in upstream_response.headers:
-                    headers[header.lower()] = upstream_response.headers[header]
-            
-            return Response(
-                status_code=upstream_response.status,
-                headers=headers
-            )
-    except aiohttp.ClientError as e:
-        logger.error(f"Stream HEAD error: {e}")
-        return PlainTextResponse(f"Upstream error: {e}", status_code=502)
+            if upstream_response.status < 400:
+                headers = {}
+                for header in ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Content-Range']:
+                    if header in upstream_response.headers:
+                        headers[header.lower()] = upstream_response.headers[header]
+                return Response(status_code=upstream_response.status, headers=headers)
+    except Exception as e:
+        logger.debug(f"HEAD request failed, returning defaults: {e}")
+    
+    # If HEAD fails or returns error, return sensible defaults
+    # This is fine - GET still works, and most players will proceed
+    default_content_type = 'video/mp2t' if stream_path.endswith('.ts') else 'video/x-matroska'
+    return Response(
+        status_code=200,
+        headers={
+            'content-type': default_content_type,
+            'accept-ranges': 'bytes'
+        }
+    )
 
 
 @app.get("/live/{username}/{password}/{stream_path:path}")
