@@ -596,6 +596,94 @@ def process_m3u(content: str) -> str:
     return '\n'.join(output)
 
 
+async def generate_m3u_from_api(provider: dict) -> str:
+    """
+    Generate M3U playlist from Xtream Codes API.
+    Used when provider disables M3U downloads but keeps API active.
+    """
+    logger.info(f"Generating M3U from API for {provider['host']}")
+    
+    # Fetch categories first for group names
+    categories_url = (f"{provider['base_url']}/player_api.php?"
+                      f"username={provider['username']}&password={provider['password']}"
+                      f"&action=get_live_categories")
+    
+    streams_url = (f"{provider['base_url']}/player_api.php?"
+                   f"username={provider['username']}&password={provider['password']}"
+                   f"&action=get_live_streams")
+    
+    try:
+        # Fetch both in parallel
+        categories_task = fetch_url_text(categories_url)
+        streams_task = fetch_url_text(streams_url)
+        
+        categories_raw, streams_raw = await asyncio.gather(categories_task, streams_task)
+        
+        categories_data = json.loads(categories_raw)
+        streams_data = json.loads(streams_raw)
+        
+        # Build category ID -> name map
+        category_map = {}
+        if isinstance(categories_data, list):
+            for cat in categories_data:
+                if isinstance(cat, dict) and 'category_id' in cat:
+                    category_map[str(cat['category_id'])] = cat.get('category_name', 'Unknown')
+        
+        logger.info(f"Loaded {len(category_map)} categories, {len(streams_data) if isinstance(streams_data, list) else 0} streams")
+        
+        # Build M3U
+        lines = ['#EXTM3U']
+        
+        if isinstance(streams_data, list):
+            for stream in streams_data:
+                if not isinstance(stream, dict):
+                    continue
+                
+                name = stream.get('name', '')
+                if not name or should_skip_channel(name):
+                    continue
+                
+                # Normalize the channel name
+                normalized_name = normalize_channel_name(name)
+                
+                stream_id = stream.get('stream_id', '')
+                epg_channel_id = stream.get('epg_channel_id', '')
+                stream_icon = stream.get('stream_icon', '')
+                category_id = str(stream.get('category_id', ''))
+                group_title = category_map.get(category_id, '')
+                
+                # Build EXTINF line
+                extinf_parts = ['-1']
+                
+                if epg_channel_id:
+                    extinf_parts.append(f'tvg-id="{epg_channel_id}"')
+                
+                extinf_parts.append(f'tvg-name="{normalized_name}"')
+                
+                if stream_icon:
+                    extinf_parts.append(f'tvg-logo="{stream_icon}"')
+                
+                if group_title:
+                    extinf_parts.append(f'group-title="{group_title}"')
+                
+                extinf_line = f"#EXTINF:{' '.join(extinf_parts)},{normalized_name}"
+                
+                # Build stream URL - use ts format
+                stream_url = f"{provider['base_url']}/live/{provider['username']}/{provider['password']}/{stream_id}.ts"
+                
+                lines.append(extinf_line)
+                lines.append(stream_url)
+        
+        m3u_content = '\n'.join(lines)
+        logger.info(f"Generated M3U with {(len(lines) - 1) // 2} channels")
+        
+        return m3u_content
+        
+    except Exception as e:
+        logger.error(f"Failed to generate M3U from API: {e}")
+        raise
+
+
 # =============================================================================
 # FASTAPI APP
 # =============================================================================
@@ -839,7 +927,7 @@ async def proxy_stream(username: str, password: str, stream_path: str, request: 
 @app.get("/playlist.m3u")
 @app.get("/")
 async def get_playlist(username: str = None, password: str = None):
-    """Get and normalize M3U playlist."""
+    """Get and normalize M3U playlist. Falls back to API generation if provider disables M3U."""
     if not username or not password:
         return JSONResponse({'error': 'Missing username or password'}, status_code=400)
     
@@ -855,16 +943,34 @@ async def get_playlist(username: str = None, password: str = None):
         return Response(content=cached, media_type="application/x-mpegurl")
     
     try:
+        # First, try the standard M3U endpoint
         url = (f"{provider['base_url']}/get.php?"
                f"username={provider['username']}&password={provider['password']}"
                f"&type=m3u_plus&output=ts")
         raw = await fetch_url_text(url)
+        
+        # Check if provider returned empty M3U (some providers disable this)
+        if not raw or not raw.strip() or raw.strip() == '#EXTM3U':
+            logger.warning(f"Provider {provider['host']} returned empty M3U, generating from API...")
+            raw = await generate_m3u_from_api(provider)
+            # No need to process - already normalized during generation
+            set_cache(cache_key, raw)
+            return Response(content=raw, media_type="application/x-mpegurl")
+        
         processed = process_m3u(raw)
         set_cache(cache_key, processed)
         return Response(content=processed, media_type="application/x-mpegurl")
     except Exception as e:
         logger.error(f"M3U fetch error: {e}")
-        return PlainTextResponse(f"Error: {e}", status_code=500)
+        # Try API fallback on any error
+        try:
+            logger.info("Attempting API fallback for M3U generation...")
+            generated = await generate_m3u_from_api(provider)
+            set_cache(cache_key, generated)
+            return Response(content=generated, media_type="application/x-mpegurl")
+        except Exception as fallback_error:
+            logger.error(f"API fallback also failed: {fallback_error}")
+            return PlainTextResponse(f"Error: {e}. Fallback failed: {fallback_error}", status_code=500)
 
 
 @app.get("/player_api.php")
