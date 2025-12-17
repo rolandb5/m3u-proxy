@@ -1,0 +1,10 @@
+# M3U Normalizing Proxy - Dependencies
+# High-performance async version
+
+# Web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Async HTTP client with connection pooling
+aiohttp>=3.9.0
+

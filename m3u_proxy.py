@@ -2,6 +2,12 @@
 """
 Transparent Xtream Codes Normalizing Proxy for Dispatcharr
 
+HIGH-PERFORMANCE ASYNC VERSION with:
+- FastAPI + Uvicorn (async, production-ready)
+- Connection pooling (aiohttp ClientSession)
+- Gzip compression
+- LRU caching for normalized names
+
 NO CONFIGURATION NEEDED - just run it!
 
 The proxy extracts provider info from the username field:
@@ -27,12 +33,17 @@ import re
 import json
 import time
 import hashlib
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
-from urllib.parse import urlparse, parse_qs, urlencode
+import asyncio
+from functools import lru_cache
+from contextlib import asynccontextmanager
+from urllib.parse import urlencode
 import logging
+
+import aiohttp
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.gzip import GZipMiddleware
+import uvicorn
 
 # Configure logging
 logging.basicConfig(
@@ -47,6 +58,9 @@ CACHE_HOURS = float(os.environ.get('CACHE_HOURS', 6))
 
 # In-memory cache: key -> {'content': ..., 'timestamp': ...}
 cache = {}
+
+# Global aiohttp session (connection pooling)
+http_session: aiohttp.ClientSession = None
 
 
 # =============================================================================
@@ -140,27 +154,19 @@ def parse_credentials(username: str, password: str) -> dict:
     Parse the username to extract provider info.
     
     Format: realuser@host:port  OR  realuser@http://host:port
-    Examples:
-      - john@provider.com:8080        -> user=john, host=provider.com, port=8080
-      - john@http://provider.com:8080 -> user=john, host=provider.com, port=8080
-      - john@provider.com             -> user=john, host=provider.com, port=80
-      - john                          -> ERROR (no provider specified)
     """
     if '@' not in username:
         return None
     
-    # Split on last @ (in case username contains @)
     at_pos = username.rfind('@')
     real_user = username[:at_pos]
     host_part = username[at_pos + 1:]
     
-    # Strip protocol if present (http:// or https://)
     if host_part.startswith('http://'):
         host_part = host_part[7:]
     elif host_part.startswith('https://'):
         host_part = host_part[8:]
     
-    # Parse host:port
     if ':' in host_part:
         host, port = host_part.rsplit(':', 1)
         try:
@@ -181,19 +187,18 @@ def parse_credentials(username: str, password: str) -> dict:
 
 
 # =============================================================================
-# NORMALIZATION RULES
+# NORMALIZATION RULES (with LRU cache)
 # =============================================================================
 
+@lru_cache(maxsize=10000)
 def normalize_channel_name(name: str) -> str:
     """
     Apply all normalization rules to a channel name.
-    Event/PPV/F1 channels are returned unchanged to preserve event info.
-    Uses pre-compiled regex patterns for performance.
+    LRU cached - repeated names are instant.
     """
     if not name:
         return name
     
-    # Skip normalization for event/F1/PPV channels - preserve their original names
     if is_event_channel(name):
         return name
     
@@ -222,7 +227,6 @@ def normalize_channel_name(name: str) -> str:
     name = RE_NO_EVENT.sub(' ', name)
     name = RE_COLON_START.sub('', name)
     name = RE_PIPE_END.sub('', name)
-    # Remove quality suffixes - order matters: longer patterns first
     name = RE_8K_PLUS_UHD.sub('', name)
     name = RE_8K_PLUS.sub('', name)
     name = RE_QUALITY.sub('', name)
@@ -246,9 +250,7 @@ def normalize_channel_name(name: str) -> str:
     name = RE_LITE.sub(r'\1 LITE', name)
     
     # === PHASE 6: Normalize special characters ===
-    # Convert accented characters to ASCII equivalents (using translate for speed)
     name = name.translate(ACCENT_TABLE)
-    # Remove apostrophes from decade names: 80's -> 80S
     name = RE_DECADE.sub(r'\1S', name)
     
     # === PHASE 7: Final cleanup and UPPERCASE ===
@@ -259,7 +261,7 @@ def normalize_channel_name(name: str) -> str:
 
 
 def should_skip_channel(name: str) -> bool:
-    """Check if this is a header/placeholder. Uses pre-compiled patterns."""
+    """Check if this is a header/placeholder."""
     if not name:
         return True
     if RE_HASH_HEADER.match(name):
@@ -273,37 +275,25 @@ def should_skip_channel(name: str) -> bool:
     return False
 
 
+@lru_cache(maxsize=10000)
 def is_event_channel(name: str) -> bool:
-    """
-    Check if this is an event/PPV/F1 channel that should NOT be normalized.
-    Uses pre-compiled patterns for performance.
-    """
+    """Check if this is an event/PPV/F1 channel. LRU cached."""
     if not name:
         return False
     
-    # Event channels with date/time patterns like "@ Dec 13 09:10 AM"
     if RE_EVENT_DATE.search(name):
         return True
-    
-    # F1 driver/feed channels (UK source) - pattern: "F1: DRIVER [TEAM]"
     if RE_F1_PREFIX.match(name):
         return True
-    
-    # F1 TV channels (NL source) - pattern: "┃F1 TV┃ ..."
     if '┃F1 TV┃' in name or '┃F1TV┃' in name:
         return True
-    
-    # VIAPLAY F1/F2/F3 content (replays, seasons)
     if RE_VIAPLAY_F.search(name):
         return True
     
-    # FORMULE (Dutch for Formula) - catches "VIAPLAY FORMULE 1"
-    # MOTOGP channels - use upper() once and check both
     name_upper = name.upper()
     if 'FORMULE' in name_upper or 'MOTOGP' in name_upper:
         return True
     
-    # Sport event pattern "Sport: Event @ Date" (catches scheduled events)
     if RE_SPORT_EVENT.match(name):
         return True
     
@@ -311,16 +301,19 @@ def is_event_channel(name: str) -> bool:
 
 
 # =============================================================================
-# HTTP HELPERS
+# ASYNC HTTP HELPERS
 # =============================================================================
 
-def fetch_url(url: str, timeout: int = 60) -> bytes:
-    """Fetch a URL and return raw bytes."""
-    req = Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
-    with urlopen(req, timeout=timeout) as response:
-        return response.read()
+async def fetch_url(url: str, timeout: int = 60) -> bytes:
+    """Fetch a URL using connection-pooled session."""
+    async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+        return await response.read()
+
+
+async def fetch_url_text(url: str, timeout: int = 60) -> str:
+    """Fetch a URL and return text."""
+    async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+        return await response.text()
 
 
 def get_cache_key(provider: dict, endpoint: str, params: dict = None) -> str:
@@ -364,7 +357,7 @@ def process_streams_json(data: list) -> list:
 
 
 def process_m3u(content: str) -> str:
-    """Normalize M3U playlist. Uses pre-compiled patterns for performance."""
+    """Normalize M3U playlist."""
     lines = content.split('\n')
     output = []
     i = 0
@@ -398,302 +391,255 @@ def process_m3u(content: str) -> str:
 
 
 # =============================================================================
-# HTTP REQUEST HANDLER
+# FASTAPI APP
 # =============================================================================
 
-class ProxyHandler(BaseHTTPRequestHandler):
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events."""
+    global http_session
     
-    def send_json(self, data: str, status: int = 200):
-        content = data.encode('utf-8')
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', len(content))
-        self.end_headers()
-        self.wfile.write(content)
+    # Startup: Create connection-pooled HTTP session
+    connector = aiohttp.TCPConnector(
+        limit=100,  # Max concurrent connections
+        limit_per_host=30,  # Max per host
+        ttl_dns_cache=300,  # DNS cache 5 minutes
+        keepalive_timeout=60  # Keep connections alive
+    )
+    http_session = aiohttp.ClientSession(
+        connector=connector,
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    )
     
-    def send_m3u(self, data: str):
-        content = data.encode('utf-8')
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/x-mpegurl')
-        self.send_header('Content-Length', len(content))
-        self.end_headers()
-        self.wfile.write(content)
+    logger.info("=" * 60)
+    logger.info("Xtream Codes Normalizing Proxy (Async + FastAPI)")
+    logger.info("=" * 60)
+    logger.info("")
+    logger.info("Performance features:")
+    logger.info("  ✓ Async I/O (handles thousands of connections)")
+    logger.info("  ✓ Connection pooling (reuses upstream connections)")
+    logger.info("  ✓ Gzip compression (smaller responses)")
+    logger.info("  ✓ LRU cache for normalized names")
+    logger.info("")
+    logger.info(f"Server running on port {PORT}")
+    logger.info(f"Cache duration: {CACHE_HOURS} hours")
+    logger.info("=" * 60)
     
-    def send_text(self, data: str, status: int = 200):
-        content = data.encode('utf-8')
-        self.send_response(status)
-        self.send_header('Content-Type', 'text/plain')
-        self.send_header('Content-Length', len(content))
-        self.end_headers()
-        self.wfile.write(content)
+    yield
     
-    def send_error_json(self, message: str):
-        self.send_json(json.dumps({
-            'user_info': {'status': 'error', 'message': message},
-            'error': message
-        }), 400)
-    
-    def proxy_binary(self, url: str, content_type: str = None):
-        """Proxy binary content (streams, images, etc.)"""
-        try:
-            req = Request(url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
-            with urlopen(req, timeout=30) as response:
-                self.send_response(200)
-                ct = content_type or response.getheader('Content-Type', 'application/octet-stream')
-                self.send_header('Content-Type', ct)
-                cl = response.getheader('Content-Length')
-                if cl:
-                    self.send_header('Content-Length', cl)
-                self.end_headers()
-                
-                while True:
-                    chunk = response.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-        except Exception as e:
-            logger.error(f"Proxy error: {e}")
-            self.send_text(str(e), 500)
-    
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        query = parse_qs(parsed.query)
-        
-        # === Health check (no auth needed) ===
-        if path == '/health':
-            self.send_text('OK')
-            return
-        
-        # === Cache stats ===
-        if path == '/cache':
-            stats = {k: {'age_hours': round((time.time() - v['timestamp']) / 3600, 2)} 
-                     for k, v in cache.items()}
-            self.send_json(json.dumps({'entries': len(cache), 'items': stats}, indent=2))
-            return
-        
-        # === Clear cache ===
-        if path == '/clear':
-            cache.clear()
-            self.send_text('Cache cleared!')
-            return
-        
-        # === Live/VOD/Series streams - handle BEFORE query param check ===
-        # These have credentials in the path: /live/username/password/stream.ts
-        if path.startswith('/live/') or path.startswith('/movie/') or path.startswith('/series/'):
-            parts = path.split('/')
-            if len(parts) >= 5:
-                stream_type = parts[1]  # live, movie, or series
-                path_username = parts[2]  # user@host:port
-                path_password = parts[3]  # password
-                stream_path = '/'.join(parts[4:])  # stream ID and extension
-                
-                provider = parse_credentials(path_username, path_password)
-                if not provider:
-                    self.send_text('Invalid credentials in stream URL', 400)
-                    return
-                
-                real_url = (f"{provider['base_url']}/{stream_type}/"
-                           f"{provider['username']}/{provider['password']}/{stream_path}")
-                
-                logger.info(f"Stream: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
-                self.proxy_binary(real_url)
-                return
-        
-        # === Extract credentials from request ===
-        username = query.get('username', [None])[0]
-        password = query.get('password', [None])[0]
-        
-        if not username or not password:
-            self.send_error_json('Missing username or password')
-            return
-        
-        provider = parse_credentials(username, password)
-        if not provider:
-            self.send_error_json(
-                'Invalid username format. Use: realuser@provider.com:port\n'
-                'Example: john@iptv-server.com:8080'
-            )
-            return
-        
-        logger.info(f"Request: {path} -> {provider['host']}:{provider['port']}")
-        
-        # === M3U Playlist ===
-        if path in ['/get.php', '/playlist.m3u', '/']:
-            cache_key = get_cache_key(provider, 'm3u')
-            cached = get_cached(cache_key)
-            
-            if cached:
-                logger.info("Serving M3U from cache")
-                self.send_m3u(cached)
-                return
-            
-            try:
-                url = (f"{provider['base_url']}/get.php?"
-                       f"username={provider['username']}&password={provider['password']}"
-                       f"&type=m3u_plus&output=ts")
-                raw = fetch_url(url).decode('utf-8', errors='replace')
-                processed = process_m3u(raw)
-                set_cache(cache_key, processed)
-                self.send_m3u(processed)
-            except Exception as e:
-                logger.error(f"M3U fetch error: {e}")
-                self.send_text(f"Error: {e}", 500)
-            return
-        
-        # === Xtream Codes API ===
-        if path == '/player_api.php':
-            action = query.get('action', [None])[0]
-            
-            # Build the real provider URL
-            real_params = {
-                'username': provider['username'],
-                'password': provider['password'],
-            }
-            if action:
-                real_params['action'] = action
-            
-            # Add any extra params (category_id, stream_id, etc.)
-            for key, values in query.items():
-                if key not in ['username', 'password', 'action']:
-                    real_params[key] = values[0]
-            
-            real_url = f"{provider['base_url']}/player_api.php?{urlencode(real_params)}"
-            cache_key = get_cache_key(provider, 'api', real_params)
-            
-            # Actions that return stream lists - normalize these
-            normalize_actions = ['get_live_streams', 'get_vod_streams', 'get_series']
-            
-            # Actions that should NOT be cached (real-time data)
-            no_cache_actions = ['get_short_epg', 'get_simple_data_table']
-            
-            # Check cache for cacheable actions
-            if action not in no_cache_actions:
-                cached = get_cached(cache_key)
-                if cached:
-                    logger.info(f"Serving {action or 'auth'} from cache")
-                    self.send_json(cached)
-                    return
-            
-            try:
-                logger.info(f"Fetching from upstream: {real_url}")
-                raw = fetch_url(real_url).decode('utf-8')
-                
-                # Normalize stream names for relevant actions
-                if action in normalize_actions:
-                    data = json.loads(raw)
-                    data = process_streams_json(data)
-                    raw = json.dumps(data)
-                
-                # Modify server info to point to our proxy
-                if action is None:  # Auth/server info request
-                    data = json.loads(raw)
-                    if 'server_info' in data:
-                        # Keep original server info but we're the proxy
-                        pass
-                    raw = json.dumps(data)
-                
-                # Cache if appropriate
-                if action not in no_cache_actions:
-                    set_cache(cache_key, raw)
-                
-                self.send_json(raw)
-                
-            except HTTPError as e:
-                logger.error(f"Upstream HTTP error: {e.code} {e.reason} for {real_url}")
-                self.send_error_json(f"Upstream server returned {e.code}: {e.reason}")
-            except URLError as e:
-                logger.error(f"Upstream connection error: {e.reason} for {real_url}")
-                self.send_error_json(f"Cannot connect to upstream: {e.reason}")
-            except Exception as e:
-                logger.error(f"API error: {e} for {real_url}")
-                self.send_error_json(str(e))
-            return
-        
-        
-        # === EPG/XMLTV ===
-        if path == '/xmltv.php' or 'xmltv' in path.lower():
-            url = (f"{provider['base_url']}/xmltv.php?"
-                   f"username={provider['username']}&password={provider['password']}")
-            try:
-                data = fetch_url(url, timeout=120)
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/xml')
-                self.send_header('Content-Length', len(data))
-                self.end_headers()
-                self.wfile.write(data)
-            except Exception as e:
-                self.send_text(f"Error: {e}", 500)
-            return
-        
-        # === Panel API (if provider supports it) ===
-        if path == '/panel_api.php':
-            real_params = {
-                'username': provider['username'],
-                'password': provider['password'],
-            }
-            for key, values in query.items():
-                if key not in ['username', 'password']:
-                    real_params[key] = values[0]
-            
-            real_url = f"{provider['base_url']}/panel_api.php?{urlencode(real_params)}"
-            try:
-                raw = fetch_url(real_url).decode('utf-8')
-                self.send_json(raw)
-            except Exception as e:
-                self.send_error_json(str(e))
-            return
-        
-        # === 404 ===
-        self.send_text('Not Found', 404)
-    
-    def log_message(self, format, *args):
-        if '/live/' not in self.path and '/movie/' not in self.path and '/series/' not in self.path:
-            logger.info(f"{self.address_string()} - {format % args}")
+    # Shutdown: Close HTTP session
+    await http_session.close()
 
 
-# =============================================================================
-# THREADED HTTP SERVER
-# =============================================================================
+app = FastAPI(title="M3U Normalizing Proxy", lifespan=lifespan)
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handle requests in separate threads for better performance."""
-    daemon_threads = True  # Don't wait for threads on shutdown
+# Add Gzip compression (min 500 bytes)
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return PlainTextResponse("OK")
+
+
+@app.get("/cache")
+async def cache_stats():
+    """Cache statistics."""
+    stats = {k: {'age_hours': round((time.time() - v['timestamp']) / 3600, 2)} 
+             for k, v in cache.items()}
+    norm_cache_info = normalize_channel_name.cache_info()
+    return JSONResponse({
+        'entries': len(cache),
+        'items': stats,
+        'normalization_cache': {
+            'hits': norm_cache_info.hits,
+            'misses': norm_cache_info.misses,
+            'size': norm_cache_info.currsize
+        }
+    })
+
+
+@app.get("/clear")
+async def clear_cache():
+    """Clear all caches."""
+    cache.clear()
+    normalize_channel_name.cache_clear()
+    is_event_channel.cache_clear()
+    return PlainTextResponse("Cache cleared!")
+
+
+@app.get("/live/{username}/{password}/{stream_path:path}")
+@app.get("/movie/{username}/{password}/{stream_path:path}")
+@app.get("/series/{username}/{password}/{stream_path:path}")
+async def proxy_stream(username: str, password: str, stream_path: str, request: Request):
+    """Proxy live/VOD/series streams."""
+    stream_type = request.url.path.split('/')[1]
+    
+    provider = parse_credentials(username, password)
+    if not provider:
+        return PlainTextResponse("Invalid credentials", status_code=400)
+    
+    real_url = f"{provider['base_url']}/{stream_type}/{provider['username']}/{provider['password']}/{stream_path}"
+    
+    logger.info(f"Stream: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
+    
+    async def stream_response():
+        async with http_session.get(real_url) as response:
+            async for chunk in response.content.iter_chunked(65536):
+                yield chunk
+    
+    return StreamingResponse(stream_response(), media_type="application/octet-stream")
+
+
+@app.get("/get.php")
+@app.get("/playlist.m3u")
+@app.get("/")
+async def get_playlist(username: str = None, password: str = None):
+    """Get and normalize M3U playlist."""
+    if not username or not password:
+        return JSONResponse({'error': 'Missing username or password'}, status_code=400)
+    
+    provider = parse_credentials(username, password)
+    if not provider:
+        return JSONResponse({'error': 'Invalid username format'}, status_code=400)
+    
+    cache_key = get_cache_key(provider, 'm3u')
+    cached = get_cached(cache_key)
+    
+    if cached:
+        logger.info("Serving M3U from cache")
+        return Response(content=cached, media_type="application/x-mpegurl")
+    
+    try:
+        url = (f"{provider['base_url']}/get.php?"
+               f"username={provider['username']}&password={provider['password']}"
+               f"&type=m3u_plus&output=ts")
+        raw = await fetch_url_text(url)
+        processed = process_m3u(raw)
+        set_cache(cache_key, processed)
+        return Response(content=processed, media_type="application/x-mpegurl")
+    except Exception as e:
+        logger.error(f"M3U fetch error: {e}")
+        return PlainTextResponse(f"Error: {e}", status_code=500)
+
+
+@app.get("/player_api.php")
+async def player_api(request: Request, username: str = None, password: str = None, action: str = None):
+    """Xtream Codes API endpoint."""
+    if not username or not password:
+        return JSONResponse({'error': 'Missing username or password'}, status_code=400)
+    
+    provider = parse_credentials(username, password)
+    if not provider:
+        return JSONResponse({'error': 'Invalid username format'}, status_code=400)
+    
+    logger.info(f"API: {action or 'auth'} -> {provider['host']}:{provider['port']}")
+    
+    # Build upstream URL
+    real_params = {
+        'username': provider['username'],
+        'password': provider['password'],
+    }
+    if action:
+        real_params['action'] = action
+    
+    # Add extra params
+    for key, value in request.query_params.items():
+        if key not in ['username', 'password', 'action']:
+            real_params[key] = value
+    
+    real_url = f"{provider['base_url']}/player_api.php?{urlencode(real_params)}"
+    cache_key = get_cache_key(provider, 'api', real_params)
+    
+    normalize_actions = ['get_live_streams', 'get_vod_streams', 'get_series']
+    no_cache_actions = ['get_short_epg', 'get_simple_data_table']
+    
+    # Check cache
+    if action not in no_cache_actions:
+        cached = get_cached(cache_key)
+        if cached:
+            logger.info(f"Serving {action or 'auth'} from cache")
+            return Response(content=cached, media_type="application/json")
+    
+    try:
+        raw = await fetch_url_text(real_url)
+        
+        if action in normalize_actions:
+            data = json.loads(raw)
+            data = process_streams_json(data)
+            raw = json.dumps(data)
+        
+        if action not in no_cache_actions:
+            set_cache(cache_key, raw)
+        
+        return Response(content=raw, media_type="application/json")
+        
+    except aiohttp.ClientError as e:
+        logger.error(f"Upstream error: {e}")
+        return JSONResponse({'error': str(e)}, status_code=502)
+    except Exception as e:
+        logger.error(f"API error: {e}")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.get("/xmltv.php")
+async def get_epg(username: str = None, password: str = None):
+    """Get EPG/XMLTV data."""
+    if not username or not password:
+        return JSONResponse({'error': 'Missing credentials'}, status_code=400)
+    
+    provider = parse_credentials(username, password)
+    if not provider:
+        return JSONResponse({'error': 'Invalid username format'}, status_code=400)
+    
+    url = (f"{provider['base_url']}/xmltv.php?"
+           f"username={provider['username']}&password={provider['password']}")
+    
+    try:
+        data = await fetch_url(url, timeout=120)
+        return Response(content=data, media_type="application/xml")
+    except Exception as e:
+        return PlainTextResponse(f"Error: {e}", status_code=500)
+
+
+@app.get("/panel_api.php")
+async def panel_api(request: Request, username: str = None, password: str = None):
+    """Panel API endpoint."""
+    if not username or not password:
+        return JSONResponse({'error': 'Missing credentials'}, status_code=400)
+    
+    provider = parse_credentials(username, password)
+    if not provider:
+        return JSONResponse({'error': 'Invalid username format'}, status_code=400)
+    
+    real_params = {
+        'username': provider['username'],
+        'password': provider['password'],
+    }
+    for key, value in request.query_params.items():
+        if key not in ['username', 'password']:
+            real_params[key] = value
+    
+    real_url = f"{provider['base_url']}/panel_api.php?{urlencode(real_params)}"
+    
+    try:
+        raw = await fetch_url_text(real_url)
+        return Response(content=raw, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def run_server():
-    server = ThreadedHTTPServer(('0.0.0.0', PORT), ProxyHandler)
-    
-    logger.info("=" * 60)
-    logger.info("Xtream Codes Normalizing Proxy (Multi-threaded)")
-    logger.info("=" * 60)
-    logger.info("")
-    logger.info("NO CONFIGURATION NEEDED!")
-    logger.info("")
-    logger.info("In Dispatcharr, add an Xtream Codes account:")
-    logger.info(f"  Server:   <this-server-ip>")
-    logger.info(f"  Port:     {PORT}")
-    logger.info("  Username: youruser@provider.com:port")
-    logger.info("  Password: yourpassword")
-    logger.info("")
-    logger.info("Example username: john@iptv-server.com:8080")
-    logger.info("")
-    logger.info(f"Cache duration: {CACHE_HOURS} hours")
-    logger.info("")
-    logger.info("Endpoints:")
-    logger.info(f"  http://localhost:{PORT}/health  - Health check")
-    logger.info(f"  http://localhost:{PORT}/cache   - Cache stats")
-    logger.info(f"  http://localhost:{PORT}/clear   - Clear cache")
-    logger.info("=" * 60)
-    
-    server.serve_forever()
-
-
 if __name__ == '__main__':
-    run_server()
+    uvicorn.run(
+        "m3u_proxy:app",
+        host="0.0.0.0",
+        port=PORT,
+        workers=4,  # Multiple worker processes
+        log_level="info",
+        access_log=False  # Disable access log for performance
+    )
