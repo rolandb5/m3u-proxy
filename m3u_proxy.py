@@ -668,8 +668,14 @@ async def generate_m3u_from_api(provider: dict) -> str:
                 
                 extinf_line = f"#EXTINF:{' '.join(extinf_parts)},{normalized_name}"
                 
-                # Build stream URL - use ts format
-                stream_url = f"{provider['base_url']}/live/{provider['username']}/{provider['password']}/{stream_id}.ts"
+                # Build DIRECT stream URL to provider (not through proxy)
+                # Omit port if it's the default (80)
+                if provider['port'] == 80:
+                    direct_base = f"http://{provider['host']}"
+                else:
+                    direct_base = f"http://{provider['host']}:{provider['port']}"
+                
+                stream_url = f"{direct_base}/live/{provider['username']}/{provider['password']}/{stream_id}.ts"
                 
                 lines.append(extinf_line)
                 lines.append(stream_url)
