@@ -878,6 +878,40 @@ async def clear_cache():
     return PlainTextResponse("Cache cleared!")
 
 
+@app.head("/live/{username}/{password}/{stream_path:path}")
+@app.head("/movie/{username}/{password}/{stream_path:path}")
+@app.head("/series/{username}/{password}/{stream_path:path}")
+async def proxy_stream_head(username: str, password: str, stream_path: str, request: Request):
+    """Handle HEAD requests for streams (used by video players to check content)."""
+    stream_type = request.url.path.split('/')[1]
+    
+    provider = parse_credentials(username, password)
+    if not provider:
+        return PlainTextResponse("Invalid credentials", status_code=400)
+    
+    real_url = f"{provider['base_url']}/{stream_type}/{provider['username']}/{provider['password']}/{stream_path}"
+    
+    logger.info(f"Stream HEAD: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
+    
+    try:
+        # Do a HEAD request to upstream
+        async with http_session.head(real_url, allow_redirects=True) as upstream_response:
+            headers = {}
+            
+            # Forward important headers
+            for header in ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Content-Range']:
+                if header in upstream_response.headers:
+                    headers[header.lower()] = upstream_response.headers[header]
+            
+            return Response(
+                status_code=upstream_response.status,
+                headers=headers
+            )
+    except aiohttp.ClientError as e:
+        logger.error(f"Stream HEAD error: {e}")
+        return PlainTextResponse(f"Upstream error: {e}", status_code=502)
+
+
 @app.get("/live/{username}/{password}/{stream_path:path}")
 @app.get("/movie/{username}/{password}/{stream_path:path}")
 @app.get("/series/{username}/{password}/{stream_path:path}")
@@ -891,11 +925,11 @@ async def proxy_stream(username: str, password: str, stream_path: str, request: 
     
     real_url = f"{provider['base_url']}/{stream_type}/{provider['username']}/{provider['password']}/{stream_path}"
     
-    logger.info(f"Stream: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
+    logger.info(f"Stream GET: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
     
     try:
-        # Make the upstream request and keep it open for streaming
-        upstream_response = await http_session.get(real_url)
+        # Make the upstream request with redirect following
+        upstream_response = await http_session.get(real_url, allow_redirects=True)
         
         # Get content type from upstream (important for video players)
         content_type = upstream_response.headers.get('Content-Type', 'video/mp2t')
@@ -907,7 +941,7 @@ async def proxy_stream(username: str, password: str, stream_path: str, request: 
             headers['Content-Length'] = content_length
         
         # Forward relevant headers from upstream
-        for header in ['Accept-Ranges', 'Content-Range']:
+        for header in ['Accept-Ranges', 'Content-Range', 'Cache-Control']:
             if header in upstream_response.headers:
                 headers[header] = upstream_response.headers[header]
         
