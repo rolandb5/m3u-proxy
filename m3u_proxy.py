@@ -569,57 +569,42 @@ def set_cache(key: str, content: str):
 # DATA PROCESSING
 # =============================================================================
 
-def process_streams_json(data: list) -> list:
+def process_streams_json(data: list, category_map: dict = None) -> list:
     """
-    Normalize names in stream list with unique suffixes.
+    Normalize names in stream list with group name suffixes.
     
-    Adds (A), (B), (C) etc. to streams with the same normalized name.
+    Format: NORMALIZED_NAME (GROUP_NAME)
+    Example: NPO 1 (┃NL┃ BASIS TV+)
+    
     This ensures each stream has a unique name while still allowing
     Stream-Mapparr to fuzzy match them (using "Ignore Miscellaneous Tags").
     """
     if not isinstance(data, list):
         return data
     
-    # First pass: normalize all names and count occurrences
-    normalized_streams = []
+    if category_map is None:
+        category_map = {}
+    
+    processed = []
     for stream in data:
         if isinstance(stream, dict) and 'name' in stream:
             if not should_skip_channel(stream['name']):
+                # Normalize the base name
                 normalized_name = normalize_channel_name(stream['name'])
-                normalized_streams.append((stream, normalized_name))
-    
-    # Count how many times each normalized name appears
-    name_counts = {}
-    for _, norm_name in normalized_streams:
-        name_counts[norm_name] = name_counts.get(norm_name, 0) + 1
-    
-    # Second pass: add suffixes only to names that appear multiple times
-    name_counters = {}  # Track which letter we're on for each name
-    processed = []
-    
-    for stream, norm_name in normalized_streams:
-        if name_counts[norm_name] > 1:
-            # This name appears multiple times, add a unique suffix
-            counter = name_counters.get(norm_name, 0)
-            # Convert counter to letter(s): 0=A, 1=B, ..., 25=Z, 26=AA, etc.
-            if counter < 26:
-                suffix = chr(65 + counter)  # A-Z
-            else:
-                # For > 26 duplicates: AA, AB, AC...
-                suffix = chr(65 + (counter // 26) - 1) + chr(65 + (counter % 26))
-            
-            stream['name'] = f"{norm_name} ({suffix})"
-            name_counters[norm_name] = counter + 1
+                
+                # Get group name from category map
+                category_id = str(stream.get('category_id', ''))
+                group_name = category_map.get(category_id, '')
+                
+                # Add group suffix if we have a group name
+                if group_name:
+                    stream['name'] = f"{normalized_name} ({group_name})"
+                else:
+                    stream['name'] = normalized_name
+                
+                processed.append(stream)
         else:
-            # Unique name, no suffix needed
-            stream['name'] = norm_name
-        
-        processed.append(stream)
-    
-    # Log some stats
-    multi_names = sum(1 for c in name_counts.values() if c > 1)
-    if multi_names > 0:
-        logger.info(f"Added unique suffixes to {sum(c for c in name_counts.values() if c > 1)} streams across {multi_names} channel names")
+            processed.append(stream)
     
     return processed
 
@@ -663,8 +648,8 @@ async def generate_m3u_from_api(provider: dict) -> str:
     Generate M3U playlist from Xtream Codes API.
     Used when provider disables M3U downloads but keeps API active.
     
-    Adds unique suffixes (A), (B), (C) to streams with duplicate names
-    to ensure they remain unique for Stream-Mapparr assignment.
+    Format: NORMALIZED_NAME (GROUP_NAME)
+    Example: NPO 1 (┃NL┃ BASIS TV+)
     """
     logger.info(f"Generating M3U from API for {provider['host']}")
     
@@ -696,8 +681,9 @@ async def generate_m3u_from_api(provider: dict) -> str:
         
         logger.info(f"Loaded {len(category_map)} categories, {len(streams_data) if isinstance(streams_data, list) else 0} streams")
         
-        # First pass: normalize names and count occurrences
-        normalized_streams = []
+        # Build M3U with group name suffixes
+        lines = ['#EXTM3U']
+        
         if isinstance(streams_data, list):
             for stream in streams_data:
                 if not isinstance(stream, dict):
@@ -707,70 +693,49 @@ async def generate_m3u_from_api(provider: dict) -> str:
                 if not name or should_skip_channel(name):
                     continue
                 
+                # Normalize the base name
                 normalized_name = normalize_channel_name(name)
-                normalized_streams.append((stream, normalized_name))
-        
-        # Count how many times each normalized name appears
-        name_counts = {}
-        for _, norm_name in normalized_streams:
-            name_counts[norm_name] = name_counts.get(norm_name, 0) + 1
-        
-        # Log stats
-        multi_names = sum(1 for c in name_counts.values() if c > 1)
-        if multi_names > 0:
-            total_dups = sum(c for c in name_counts.values() if c > 1)
-            logger.info(f"Adding unique suffixes to {total_dups} streams across {multi_names} channel names")
-        
-        # Second pass: build M3U with unique suffixes
-        lines = ['#EXTM3U']
-        name_counters = {}  # Track which letter we're on for each name
-        
-        for stream, normalized_name in normalized_streams:
-            # Add suffix if this name appears multiple times
-            if name_counts[normalized_name] > 1:
-                counter = name_counters.get(normalized_name, 0)
-                if counter < 26:
-                    suffix = chr(65 + counter)  # A-Z
-                else:
-                    suffix = chr(65 + (counter // 26) - 1) + chr(65 + (counter % 26))
                 
-                final_name = f"{normalized_name} ({suffix})"
-                name_counters[normalized_name] = counter + 1
-            else:
-                final_name = normalized_name
-            
-            stream_id = stream.get('stream_id', '')
-            epg_channel_id = stream.get('epg_channel_id', '')
-            stream_icon = stream.get('stream_icon', '')
-            category_id = str(stream.get('category_id', ''))
-            group_title = category_map.get(category_id, '')
-            
-            # Build EXTINF line
-            extinf_parts = ['-1']
-            
-            if epg_channel_id:
-                extinf_parts.append(f'tvg-id="{epg_channel_id}"')
-            
-            extinf_parts.append(f'tvg-name="{final_name}"')
-            
-            if stream_icon:
-                extinf_parts.append(f'tvg-logo="{stream_icon}"')
-            
-            if group_title:
-                extinf_parts.append(f'group-title="{group_title}"')
-            
-            extinf_line = f"#EXTINF:{' '.join(extinf_parts)},{final_name}"
-            
-            # Build DIRECT stream URL to provider (not through proxy)
-            if provider['port'] == 80:
-                direct_base = f"http://{provider['host']}"
-            else:
-                direct_base = f"http://{provider['host']}:{provider['port']}"
-            
-            stream_url = f"{direct_base}/live/{provider['username']}/{provider['password']}/{stream_id}.ts"
-            
-            lines.append(extinf_line)
-            lines.append(stream_url)
+                # Get group name
+                category_id = str(stream.get('category_id', ''))
+                group_title = category_map.get(category_id, '')
+                
+                # Final name format: NORMALIZED_NAME (GROUP_NAME)
+                if group_title:
+                    final_name = f"{normalized_name} ({group_title})"
+                else:
+                    final_name = normalized_name
+                
+                stream_id = stream.get('stream_id', '')
+                epg_channel_id = stream.get('epg_channel_id', '')
+                stream_icon = stream.get('stream_icon', '')
+                
+                # Build EXTINF line
+                extinf_parts = ['-1']
+                
+                if epg_channel_id:
+                    extinf_parts.append(f'tvg-id="{epg_channel_id}"')
+                
+                extinf_parts.append(f'tvg-name="{final_name}"')
+                
+                if stream_icon:
+                    extinf_parts.append(f'tvg-logo="{stream_icon}"')
+                
+                if group_title:
+                    extinf_parts.append(f'group-title="{group_title}"')
+                
+                extinf_line = f"#EXTINF:{' '.join(extinf_parts)},{final_name}"
+                
+                # Build DIRECT stream URL to provider (not through proxy)
+                if provider['port'] == 80:
+                    direct_base = f"http://{provider['host']}"
+                else:
+                    direct_base = f"http://{provider['host']}:{provider['port']}"
+                
+                stream_url = f"{direct_base}/live/{provider['username']}/{provider['password']}/{stream_id}.ts"
+                
+                lines.append(extinf_line)
+                lines.append(stream_url)
         
         m3u_content = '\n'.join(lines)
         logger.info(f"Generated M3U with {(len(lines) - 1) // 2} channels")
@@ -1151,11 +1116,35 @@ async def player_api(request: Request, username: str = None, password: str = Non
             return Response(content=cached, media_type="application/json")
     
     try:
-        raw = await fetch_url_text(real_url)
+        # For live streams, we need categories first to build group name suffixes
+        category_map = {}
+        if action == 'get_live_streams':
+            # Fetch categories in parallel with streams
+            categories_url = (f"{provider['base_url']}/player_api.php?"
+                              f"username={provider['username']}&password={provider['password']}"
+                              f"&action=get_live_categories")
+            
+            categories_task = fetch_url_text(categories_url)
+            streams_task = fetch_url_text(real_url)
+            
+            categories_raw, raw = await asyncio.gather(categories_task, streams_task)
+            
+            # Build category map
+            try:
+                categories_data = json.loads(categories_raw)
+                if isinstance(categories_data, list):
+                    for cat in categories_data:
+                        if isinstance(cat, dict) and 'category_id' in cat:
+                            category_map[str(cat['category_id'])] = cat.get('category_name', '')
+                logger.info(f"Loaded {len(category_map)} categories for stream naming")
+            except Exception as e:
+                logger.warning(f"Failed to load categories: {e}")
+        else:
+            raw = await fetch_url_text(real_url)
         
         if action in normalize_actions:
             data = json.loads(raw)
-            data = process_streams_json(data)
+            data = process_streams_json(data, category_map)
             raw = json.dumps(data)
         
         if action not in no_cache_actions:
