@@ -354,6 +354,33 @@ CHANNEL_ALIASES = {
 # CREDENTIAL PARSING
 # =============================================================================
 
+def extract_provider_name(host: str) -> str:
+    """
+    Extract a clean provider name from hostname.
+    
+    Examples:
+        gaminghub8k.xyz -> gaminghub8k
+        line.tivi-ott.net -> tivi-ott
+        iptv-provider.com -> iptv-provider
+    """
+    # Remove common TLDs
+    for tld in ['.xyz', '.net', '.com', '.org', '.tv', '.io', '.me', '.cc', '.co']:
+        if host.endswith(tld):
+            host = host[:-len(tld)]
+            break
+    
+    # If hostname has subdomains (like line.tivi-ott), use the main part
+    parts = host.split('.')
+    if len(parts) > 1:
+        # Use the last part (main domain) unless it's very short
+        main_part = parts[-1]
+        if len(main_part) < 3 and len(parts) > 1:
+            main_part = parts[-2]
+        return main_part
+    
+    return host
+
+
 def parse_credentials(username: str, password: str) -> dict:
     """
     Parse the username to extract provider info.
@@ -382,12 +409,16 @@ def parse_credentials(username: str, password: str) -> dict:
         host = host_part
         port = 80
     
+    # Extract clean provider name for display
+    provider_name = extract_provider_name(host)
+    
     return {
         'username': real_user,
         'password': password,
         'host': host,
         'port': port,
-        'base_url': f"http://{host}:{port}"
+        'base_url': f"http://{host}:{port}",
+        'provider_name': provider_name
     }
 
 
@@ -569,12 +600,12 @@ def set_cache(key: str, content: str):
 # DATA PROCESSING
 # =============================================================================
 
-def process_streams_json(data: list, category_map: dict = None) -> list:
+def process_streams_json(data: list, category_map: dict = None, provider_name: str = None) -> list:
     """
-    Normalize names in stream list with group name suffixes.
+    Normalize names in stream list with provider and group name suffixes.
     
-    Format: NORMALIZED_NAME (GROUP_NAME)
-    Example: NPO 1 (┃NL┃ BASIS TV+)
+    Format: NORMALIZED_NAME (PROVIDER_NAME) (GROUP_NAME)
+    Example: NPO 1 (gaminghub8k) (┃NL┃ BASIS TV+)
     
     This ensures each stream has a unique name while still allowing
     Stream-Mapparr to fuzzy match them (using "Ignore Miscellaneous Tags").
@@ -596,9 +627,15 @@ def process_streams_json(data: list, category_map: dict = None) -> list:
                 category_id = str(stream.get('category_id', ''))
                 group_name = category_map.get(category_id, '')
                 
-                # Add group suffix if we have a group name
+                # Build suffix: (provider) (group)
+                suffix_parts = []
+                if provider_name:
+                    suffix_parts.append(f"({provider_name})")
                 if group_name:
-                    stream['name'] = f"{normalized_name} ({group_name})"
+                    suffix_parts.append(f"({group_name})")
+                
+                if suffix_parts:
+                    stream['name'] = f"{normalized_name} {' '.join(suffix_parts)}"
                 else:
                     stream['name'] = normalized_name
                 
@@ -648,10 +685,11 @@ async def generate_m3u_from_api(provider: dict) -> str:
     Generate M3U playlist from Xtream Codes API.
     Used when provider disables M3U downloads but keeps API active.
     
-    Format: NORMALIZED_NAME (GROUP_NAME)
-    Example: NPO 1 (┃NL┃ BASIS TV+)
+    Format: NORMALIZED_NAME (PROVIDER_NAME) (GROUP_NAME)
+    Example: NPO 1 (gaminghub8k) (┃NL┃ BASIS TV+)
     """
-    logger.info(f"Generating M3U from API for {provider['host']}")
+    provider_name = provider.get('provider_name', '')
+    logger.info(f"Generating M3U from API for {provider['host']} (provider: {provider_name})")
     
     # Fetch categories first for group names
     categories_url = (f"{provider['base_url']}/player_api.php?"
@@ -681,7 +719,7 @@ async def generate_m3u_from_api(provider: dict) -> str:
         
         logger.info(f"Loaded {len(category_map)} categories, {len(streams_data) if isinstance(streams_data, list) else 0} streams")
         
-        # Build M3U with group name suffixes
+        # Build M3U with provider and group name suffixes
         lines = ['#EXTM3U']
         
         if isinstance(streams_data, list):
@@ -700,9 +738,15 @@ async def generate_m3u_from_api(provider: dict) -> str:
                 category_id = str(stream.get('category_id', ''))
                 group_title = category_map.get(category_id, '')
                 
-                # Final name format: NORMALIZED_NAME (GROUP_NAME)
+                # Final name format: NORMALIZED_NAME (PROVIDER) (GROUP_NAME)
+                suffix_parts = []
+                if provider_name:
+                    suffix_parts.append(f"({provider_name})")
                 if group_title:
-                    final_name = f"{normalized_name} ({group_title})"
+                    suffix_parts.append(f"({group_title})")
+                
+                if suffix_parts:
+                    final_name = f"{normalized_name} {' '.join(suffix_parts)}"
                 else:
                     final_name = normalized_name
                 
@@ -1144,7 +1188,7 @@ async def player_api(request: Request, username: str = None, password: str = Non
         
         if action in normalize_actions:
             data = json.loads(raw)
-            data = process_streams_json(data, category_map)
+            data = process_streams_json(data, category_map, provider.get('provider_name', ''))
             raw = json.dumps(data)
         
         if action not in no_cache_actions:
