@@ -263,6 +263,7 @@ RE_NL_PIPE = re.compile(r'^NL\|\s*', re.IGNORECASE)
 RE_UK_PIPE = re.compile(r'^UK\|\s*', re.IGNORECASE)
 RE_PLAY_PLUS = re.compile(r'^PLAY\+:\s*', re.IGNORECASE)
 RE_OD = re.compile(r'^OD:\s*', re.IGNORECASE)
+RE_ZONE_PLUS = re.compile(r'^ZONE\+\s*', re.IGNORECASE)  # "ZONE+ " prefix
 # Additional country prefixes
 RE_COUNTRY_PREFIX = re.compile(r'^[A-Z]{2}:\s*', re.IGNORECASE)  # Any "XX: " prefix
 
@@ -412,6 +413,7 @@ def normalize_channel_name(name: str) -> str:
     name = RE_UK_PIPE.sub('', name)
     name = RE_PLAY_PLUS.sub('', name)
     name = RE_OD.sub('', name)
+    name = RE_ZONE_PLUS.sub('', name)  # Remove "ZONE+ " prefix
     name = RE_COUNTRY_PREFIX.sub('', name)  # Catch any remaining "XX: " prefixes
     
     # === PHASE 2: Remove special Unicode characters ===
