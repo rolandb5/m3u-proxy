@@ -46,7 +46,7 @@ import logging
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -892,8 +892,11 @@ async def clear_cache():
 @app.head("/live/{username}/{password}/{stream_path:path}")
 @app.head("/movie/{username}/{password}/{stream_path:path}")
 @app.head("/series/{username}/{password}/{stream_path:path}")
-async def proxy_stream_head(username: str, password: str, stream_path: str, request: Request):
-    """Handle HEAD requests for streams (used by video players to check content)."""
+async def redirect_stream_head(username: str, password: str, stream_path: str, request: Request):
+    """
+    Redirect HEAD requests to the actual provider.
+    Same as GET - we don't proxy video traffic.
+    """
     stream_type = request.url.path.split('/')[1]
     
     provider = parse_credentials(username, password)
@@ -902,81 +905,39 @@ async def proxy_stream_head(username: str, password: str, stream_path: str, requ
     
     real_url = f"{provider['base_url']}/{stream_type}/{provider['username']}/{provider['password']}/{stream_path}"
     
-    logger.info(f"Stream HEAD: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
+    logger.info(f"Stream HEAD REDIRECT: {stream_type}/{stream_path} -> {real_url}")
     
-    try:
-        # Try HEAD request first
-        async with http_session.head(real_url, allow_redirects=True) as upstream_response:
-            if upstream_response.status < 400:
-                headers = {}
-                for header in ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Content-Range']:
-                    if header in upstream_response.headers:
-                        headers[header.lower()] = upstream_response.headers[header]
-                return Response(status_code=upstream_response.status, headers=headers)
-    except Exception as e:
-        logger.debug(f"HEAD request failed, returning defaults: {e}")
-    
-    # If HEAD fails or returns error, return sensible defaults
-    # This is fine - GET still works, and most players will proceed
-    default_content_type = 'video/mp2t' if stream_path.endswith('.ts') else 'video/x-matroska'
-    return Response(
-        status_code=200,
-        headers={
-            'content-type': default_content_type,
-            'accept-ranges': 'bytes'
-        }
-    )
+    return RedirectResponse(url=real_url, status_code=302)
 
 
 @app.get("/live/{username}/{password}/{stream_path:path}")
 @app.get("/movie/{username}/{password}/{stream_path:path}")
 @app.get("/series/{username}/{password}/{stream_path:path}")
-async def proxy_stream(username: str, password: str, stream_path: str, request: Request):
-    """Proxy live/VOD/series streams with proper header forwarding."""
+async def redirect_stream(username: str, password: str, stream_path: str, request: Request):
+    """
+    Redirect stream requests to the actual provider.
+    
+    This ensures video traffic goes DIRECTLY to the provider,
+    not through this proxy. The proxy only handles:
+    - M3U playlist normalization
+    - API response normalization
+    
+    Video streams are redirected, not proxied.
+    """
     stream_type = request.url.path.split('/')[1]
     
     provider = parse_credentials(username, password)
     if not provider:
         return PlainTextResponse("Invalid credentials", status_code=400)
     
+    # Build the direct URL to the provider
     real_url = f"{provider['base_url']}/{stream_type}/{provider['username']}/{provider['password']}/{stream_path}"
     
-    logger.info(f"Stream GET: {stream_type}/{stream_path} -> {provider['host']}:{provider['port']}")
+    logger.info(f"Stream REDIRECT: {stream_type}/{stream_path} -> {real_url}")
     
-    try:
-        # Make the upstream request with redirect following
-        upstream_response = await http_session.get(real_url, allow_redirects=True)
-        
-        # Get content type from upstream (important for video players)
-        content_type = upstream_response.headers.get('Content-Type', 'video/mp2t')
-        content_length = upstream_response.headers.get('Content-Length')
-        
-        # Build response headers
-        headers = {}
-        if content_length:
-            headers['Content-Length'] = content_length
-        
-        # Forward relevant headers from upstream
-        for header in ['Accept-Ranges', 'Content-Range', 'Cache-Control']:
-            if header in upstream_response.headers:
-                headers[header] = upstream_response.headers[header]
-        
-        async def stream_generator():
-            try:
-                async for chunk in upstream_response.content.iter_chunked(65536):
-                    yield chunk
-            finally:
-                upstream_response.close()
-        
-        return StreamingResponse(
-            stream_generator(),
-            status_code=upstream_response.status,
-            media_type=content_type,
-            headers=headers
-        )
-    except aiohttp.ClientError as e:
-        logger.error(f"Stream proxy error: {e}")
-        return PlainTextResponse(f"Upstream error: {e}", status_code=502)
+    # Return a redirect to the actual provider
+    # 302 Found is used so clients don't cache the redirect
+    return RedirectResponse(url=real_url, status_code=302)
 
 
 @app.get("/get.php")
