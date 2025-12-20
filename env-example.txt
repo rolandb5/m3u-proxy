@@ -15,3 +15,16 @@
 
 # How long to cache API responses, in hours (default: 6)
 # CACHE_HOURS=6
+
+# =====================================================
+# Optional: Stream Naming Settings
+# =====================================================
+
+# Groups that should NOT have (provider) (group) suffixes added.
+# Useful for groups with "Auto Channel Sync" enabled in Dispatcharr,
+# where stream names become channel names directly.
+#
+# Format: comma-separated list of patterns (case-insensitive substring match)
+# Example: Groups containing "PPV", "VIAPLAY", "EVENT", etc. won't get suffixes
+#
+# NO_SUFFIX_GROUPS=PPV,VIAPLAY,DAZN,EVENT,FEYENOORD,ESPN PPV,MAX PPV

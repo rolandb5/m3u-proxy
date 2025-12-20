@@ -11,6 +11,11 @@ services:
       
       # Cache duration in hours (default: 6)
       - CACHE_HOURS=6
+      
+      # Groups that should NOT have (provider) (group) suffixes
+      # For groups with "Auto Channel Sync" enabled in Dispatcharr
+      # Format: comma-separated patterns (case-insensitive)
+      # - NO_SUFFIX_GROUPS=PPV,VIAPLAY,DAZN,EVENT,FEYENOORD
     
     # Memory limits to prevent runaway memory usage
     mem_limit: 512m
