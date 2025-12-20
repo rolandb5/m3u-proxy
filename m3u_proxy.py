@@ -345,6 +345,7 @@ CHANNEL_ALIASES = {
     'EEN': 'E! ENTERTAINMENT',
     'DREAM WORKS': 'DREAMWORKS',
     'M TV': 'MTV',
+    'RTV-7': 'RTV 7',
     # Add more aliases here as needed
 }
 
