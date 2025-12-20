@@ -335,6 +335,16 @@ ACCENT_TABLE = str.maketrans({
     'ä': 'A', 'Ä': 'A'
 })
 
+# =============================================================================
+# CHANNEL NAME ALIASES (map variations to canonical names)
+# =============================================================================
+# These are applied AFTER all other normalization, matching against uppercase
+CHANNEL_ALIASES = {
+    'E!': 'E! ENTERTAINMENT',
+    'EEN': 'E! ENTERTAINMENT',
+    # Add more aliases here as needed
+}
+
 
 # =============================================================================
 # CREDENTIAL PARSING
@@ -448,6 +458,10 @@ def normalize_channel_name(name: str) -> str:
     # === PHASE 7: Final cleanup and UPPERCASE ===
     name = RE_MULTI_SPACE.sub(' ', name)
     name = name.strip().upper()
+    
+    # === PHASE 8: Apply channel aliases (exact match after normalization) ===
+    if name in CHANNEL_ALIASES:
+        name = CHANNEL_ALIASES[name]
     
     return name
 
