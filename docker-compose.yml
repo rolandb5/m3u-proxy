@@ -11,3 +11,7 @@ services:
       
       # Cache duration in hours (default: 6)
       - CACHE_HOURS=6
+    
+    # Memory limits to prevent runaway memory usage
+    mem_limit: 512m
+    memswap_limit: 512m
