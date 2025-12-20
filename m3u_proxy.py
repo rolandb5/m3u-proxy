@@ -258,11 +258,13 @@ perf = PerformanceMonitor()
 
 # Phase 1: Provider wrappers
 RE_WRAPPER = re.compile(r'┃[^┃]+┃\s*')
-RE_NL_COLON = re.compile(r'^NL:\s*')
-RE_NL_PIPE = re.compile(r'^NL\|\s*')
-RE_UK_PIPE = re.compile(r'^UK\|\s*')
-RE_PLAY_PLUS = re.compile(r'^PLAY\+:\s*')
-RE_OD = re.compile(r'^OD:\s*')
+RE_NL_COLON = re.compile(r'^NL:\s*', re.IGNORECASE)
+RE_NL_PIPE = re.compile(r'^NL\|\s*', re.IGNORECASE)
+RE_UK_PIPE = re.compile(r'^UK\|\s*', re.IGNORECASE)
+RE_PLAY_PLUS = re.compile(r'^PLAY\+:\s*', re.IGNORECASE)
+RE_OD = re.compile(r'^OD:\s*', re.IGNORECASE)
+# Additional country prefixes
+RE_COUNTRY_PREFIX = re.compile(r'^[A-Z]{2}:\s*', re.IGNORECASE)  # Any "XX: " prefix
 
 # Phase 2: Special Unicode characters
 RE_VIP = re.compile(r'\s*ⱽᴵᴾ\s*')
@@ -398,6 +400,7 @@ def normalize_channel_name(name: str) -> str:
     name = RE_UK_PIPE.sub('', name)
     name = RE_PLAY_PLUS.sub('', name)
     name = RE_OD.sub('', name)
+    name = RE_COUNTRY_PREFIX.sub('', name)  # Catch any remaining "XX: " prefixes
     
     # === PHASE 2: Remove special Unicode characters ===
     name = RE_VIP.sub('', name)
@@ -887,6 +890,36 @@ async def clear_cache():
     normalize_channel_name.cache_clear()
     is_event_channel.cache_clear()
     return PlainTextResponse("Cache cleared!")
+
+
+@app.get("/test")
+async def test_normalization(name: str = None):
+    """Test channel name normalization. Usage: /test?name=NL: NPO1 ᴿᴬᵂ ◉"""
+    if not name:
+        # Default test cases
+        test_cases = [
+            "NL: NPO1 ᴿᴬᵂ ◉",
+            "NL: NPO 2 ᴴᴰ",
+            "┃NL┃ RTL4 HD",
+            "NL| SBS6 FHD 50FPS",
+            "NPO1",
+            "ESPN1 HD",
+            "24KITCHEN",
+            "Film1 Premiere",
+        ]
+        results = {tc: normalize_channel_name(tc) for tc in test_cases}
+        return JSONResponse({
+            "test_cases": results,
+            "usage": "Add ?name=YOUR_CHANNEL_NAME to test a specific name"
+        })
+    
+    original = name
+    normalized = normalize_channel_name(name)
+    return JSONResponse({
+        "original": original,
+        "normalized": normalized,
+        "changed": original != normalized
+    })
 
 
 @app.head("/live/{username}/{password}/{stream_path:path}")
