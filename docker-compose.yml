@@ -14,8 +14,8 @@ services:
       
       # Groups that should NOT have (provider) (group) suffixes
       # For groups with "Auto Channel Sync" enabled in Dispatcharr
-      # Format: comma-separated patterns (case-insensitive)
-      # - NO_SUFFIX_GROUPS=PPV,VIAPLAY,DAZN,EVENT,FEYENOORD
+      # Format: EXACT group names separated by | (pipe)
+      # - NO_SUFFIX_GROUPS=NL| ODIDO VERMAAK RAW GOLD|NL| 8TKO PPV|NL| VIAPLAY PPV
     
     # Memory limits to prevent runaway memory usage
     mem_limit: 512m

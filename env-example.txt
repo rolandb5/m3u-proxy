@@ -24,7 +24,7 @@
 # Useful for groups with "Auto Channel Sync" enabled in Dispatcharr,
 # where stream names become channel names directly.
 #
-# Format: comma-separated list of patterns (case-insensitive substring match)
-# Example: Groups containing "PPV", "VIAPLAY", "EVENT", etc. won't get suffixes
+# Format: EXACT group names separated by | (pipe), case-insensitive
+# Copy the exact group names from Dispatcharr's Groups settings
 #
-# NO_SUFFIX_GROUPS=PPV,VIAPLAY,DAZN,EVENT,FEYENOORD,ESPN PPV,MAX PPV
+# NO_SUFFIX_GROUPS=NL| ODIDO VERMAAK RAW GOLD|NL| 8TKO PPV|NL| MAX PPV|NL| VIAPLAY PPV
