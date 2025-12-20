@@ -342,6 +342,7 @@ ACCENT_TABLE = str.maketrans({
 CHANNEL_ALIASES = {
     'E!': 'E! ENTERTAINMENT',
     'EEN': 'E! ENTERTAINMENT',
+    'DREAM WORKS': 'DREAMWORKS',
     # Add more aliases here as needed
 }
 
