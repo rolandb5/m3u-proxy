@@ -64,20 +64,19 @@ CACHE_HOURS = float(os.environ.get('CACHE_HOURS', 6))
 
 # Groups that should NOT have (provider) (group) suffixes added
 # These are typically groups with "Auto Channel Sync" enabled in Dispatcharr
-# Format: comma-separated list of group name patterns (case-insensitive substring match)
-# Example: "PPV,EVENT,VIAPLAY,DAZN,FEYENOORD,MAX PPV,ESPN PPV"
+# Format: comma-separated list of EXACT group names (case-insensitive)
+# Use | as separator since group names may contain commas
+# Example: "NL| ODIDO VERMAAK RAW GOLD|NL| 8TKO PPV|NL| VIAPLAY PPV"
 NO_SUFFIX_GROUPS_RAW = os.environ.get('NO_SUFFIX_GROUPS', '')
-NO_SUFFIX_GROUPS = [g.strip().upper() for g in NO_SUFFIX_GROUPS_RAW.split(',') if g.strip()]
+NO_SUFFIX_GROUPS = [g.strip().upper() for g in NO_SUFFIX_GROUPS_RAW.split('|') if g.strip()]
 
 def should_skip_suffix(group_name: str) -> bool:
-    """Check if this group should NOT have (provider) (group) suffix added."""
+    """Check if this group should NOT have (provider) (group) suffix added. EXACT match."""
     if not NO_SUFFIX_GROUPS or not group_name:
         return False
-    group_upper = group_name.upper()
-    for pattern in NO_SUFFIX_GROUPS:
-        if pattern in group_upper:
-            return True
-    return False
+    # Normalize group name for comparison (uppercase, strip whitespace)
+    group_normalized = group_name.strip().upper()
+    return group_normalized in NO_SUFFIX_GROUPS
 
 # In-memory cache: key -> {'content': ..., 'timestamp': ...}
 cache = {}
