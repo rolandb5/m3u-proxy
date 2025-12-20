@@ -62,6 +62,23 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get('PORT', 8765))
 CACHE_HOURS = float(os.environ.get('CACHE_HOURS', 6))
 
+# Groups that should NOT have (provider) (group) suffixes added
+# These are typically groups with "Auto Channel Sync" enabled in Dispatcharr
+# Format: comma-separated list of group name patterns (case-insensitive substring match)
+# Example: "PPV,EVENT,VIAPLAY,DAZN,FEYENOORD,MAX PPV,ESPN PPV"
+NO_SUFFIX_GROUPS_RAW = os.environ.get('NO_SUFFIX_GROUPS', '')
+NO_SUFFIX_GROUPS = [g.strip().upper() for g in NO_SUFFIX_GROUPS_RAW.split(',') if g.strip()]
+
+def should_skip_suffix(group_name: str) -> bool:
+    """Check if this group should NOT have (provider) (group) suffix added."""
+    if not NO_SUFFIX_GROUPS or not group_name:
+        return False
+    group_upper = group_name.upper()
+    for pattern in NO_SUFFIX_GROUPS:
+        if pattern in group_upper:
+            return True
+    return False
+
 # In-memory cache: key -> {'content': ..., 'timestamp': ...}
 cache = {}
 
@@ -607,8 +624,8 @@ def process_streams_json(data: list, category_map: dict = None, provider_name: s
     Format: NORMALIZED_NAME (PROVIDER_NAME) (GROUP_NAME)
     Example: NPO 1 (gaminghub8k) (┃NL┃ BASIS TV+)
     
-    This ensures each stream has a unique name while still allowing
-    Stream-Mapparr to fuzzy match them (using "Ignore Miscellaneous Tags").
+    Groups matching NO_SUFFIX_GROUPS patterns will NOT have suffixes added
+    (for groups with Auto Channel Sync enabled in Dispatcharr).
     """
     if not isinstance(data, list):
         return data
@@ -617,6 +634,8 @@ def process_streams_json(data: list, category_map: dict = None, provider_name: s
         category_map = {}
     
     processed = []
+    skipped_count = 0
+    
     for stream in data:
         if isinstance(stream, dict) and 'name' in stream:
             if not should_skip_channel(stream['name']):
@@ -627,21 +646,29 @@ def process_streams_json(data: list, category_map: dict = None, provider_name: s
                 category_id = str(stream.get('category_id', ''))
                 group_name = category_map.get(category_id, '')
                 
-                # Build suffix: (provider) (group)
-                suffix_parts = []
-                if provider_name:
-                    suffix_parts.append(f"({provider_name})")
-                if group_name:
-                    suffix_parts.append(f"({group_name})")
-                
-                if suffix_parts:
-                    stream['name'] = f"{normalized_name} {' '.join(suffix_parts)}"
-                else:
+                # Check if this group should skip suffixes
+                if should_skip_suffix(group_name):
                     stream['name'] = normalized_name
+                    skipped_count += 1
+                else:
+                    # Build suffix: (provider) (group)
+                    suffix_parts = []
+                    if provider_name:
+                        suffix_parts.append(f"({provider_name})")
+                    if group_name:
+                        suffix_parts.append(f"({group_name})")
+                    
+                    if suffix_parts:
+                        stream['name'] = f"{normalized_name} {' '.join(suffix_parts)}"
+                    else:
+                        stream['name'] = normalized_name
                 
                 processed.append(stream)
         else:
             processed.append(stream)
+    
+    if skipped_count > 0:
+        logger.info(f"Skipped suffixes for {skipped_count} streams (NO_SUFFIX_GROUPS)")
     
     return processed
 
@@ -738,17 +765,21 @@ async def generate_m3u_from_api(provider: dict) -> str:
                 category_id = str(stream.get('category_id', ''))
                 group_title = category_map.get(category_id, '')
                 
-                # Final name format: NORMALIZED_NAME (PROVIDER) (GROUP_NAME)
-                suffix_parts = []
-                if provider_name:
-                    suffix_parts.append(f"({provider_name})")
-                if group_title:
-                    suffix_parts.append(f"({group_title})")
-                
-                if suffix_parts:
-                    final_name = f"{normalized_name} {' '.join(suffix_parts)}"
-                else:
+                # Check if this group should skip suffixes
+                if should_skip_suffix(group_title):
                     final_name = normalized_name
+                else:
+                    # Final name format: NORMALIZED_NAME (PROVIDER) (GROUP_NAME)
+                    suffix_parts = []
+                    if provider_name:
+                        suffix_parts.append(f"({provider_name})")
+                    if group_title:
+                        suffix_parts.append(f"({group_title})")
+                    
+                    if suffix_parts:
+                        final_name = f"{normalized_name} {' '.join(suffix_parts)}"
+                    else:
+                        final_name = normalized_name
                 
                 stream_id = stream.get('stream_id', '')
                 epg_channel_id = stream.get('epg_channel_id', '')
