@@ -1355,6 +1355,24 @@ async def player_api(request: Request, username: str = None, password: str = Non
             )
             raw = json.dumps(data)
         
+        # For authentication response (no action), override server_info to point to real provider
+        # This makes Dispatcharr construct URLs directly to the provider, not through proxy
+        if not action and DIRECT_URLS:
+            try:
+                auth_data = json.loads(raw)
+                if isinstance(auth_data, dict) and 'server_info' in auth_data:
+                    # Override server URL to point to real provider
+                    auth_data['server_info']['url'] = f"http://{provider['host']}"
+                    auth_data['server_info']['port'] = str(provider['port'])
+                    # Also override username/password in server_info if present
+                    if 'username' in auth_data.get('user_info', {}):
+                        auth_data['user_info']['username'] = provider['username']
+                        auth_data['user_info']['password'] = provider['password']
+                    logger.info(f"[DIRECT-URLS] Overriding server_info to: {provider['host']}:{provider['port']}")
+                    raw = json.dumps(auth_data)
+            except Exception as e:
+                logger.warning(f"Failed to override server_info: {e}")
+        
         if action not in no_cache_actions:
             set_cache(cache_key, raw)
         
