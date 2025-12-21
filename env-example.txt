@@ -28,3 +28,31 @@
 # Copy the exact group names from Dispatcharr's Groups settings
 #
 # NO_SUFFIX_GROUPS=NL| ODIDO VERMAAK RAW GOLD,NL| 8TKO PPV,NL| MAX PPV,NL| VIAPLAY PPV
+
+# =====================================================
+# Optional: Smart Validation (for Redirect mode)
+# =====================================================
+
+# Enable smart validation: test provider streams before redirecting
+# This allows Dispatcharr's failover to work with Redirect mode.
+# When a stream is dead (405, timeout), proxy returns 502 instead of 302,
+# so Dispatcharr tries the next available stream.
+#
+# Default: true (enabled)
+# SMART_VALIDATION=true
+
+# Timeout for stream validation in seconds (default: 5)
+# Increase if your provider is slow to respond
+# VALIDATION_TIMEOUT=5
+
+# =====================================================
+# Optional: Direct URL Injection
+# =====================================================
+
+# Inject direct provider URLs in API responses
+# When enabled, adds 'direct_source' field to each stream pointing
+# directly to the IPTV provider instead of through the proxy.
+# This allows clients that support it to bypass the proxy for playback.
+#
+# Default: true (enabled)
+# DIRECT_URLS=true
