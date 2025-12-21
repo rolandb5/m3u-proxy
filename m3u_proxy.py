@@ -615,7 +615,13 @@ def set_cache(key: str, content: str):
 # DATA PROCESSING
 # =============================================================================
 
-def process_streams_json(data: list, category_map: dict = None, provider_name: str = None) -> list:
+# Enable direct URL injection in API responses
+# When enabled, adds direct_source field to streams pointing to real provider
+DIRECT_URLS = os.environ.get('DIRECT_URLS', 'true').lower() in ('true', '1', 'yes')
+
+
+def process_streams_json(data: list, category_map: dict = None, provider_name: str = None, 
+                         provider_info: dict = None, stream_type: str = 'live') -> list:
     """
     Normalize names in stream list with provider and group name suffixes.
     
@@ -624,12 +630,24 @@ def process_streams_json(data: list, category_map: dict = None, provider_name: s
     
     Groups matching NO_SUFFIX_GROUPS patterns will NOT have suffixes added
     (for groups with Auto Channel Sync enabled in Dispatcharr).
+    
+    If DIRECT_URLS is enabled and provider_info is provided, adds direct_source
+    field pointing directly to the IPTV provider (bypassing proxy).
     """
     if not isinstance(data, list):
         return data
     
     if category_map is None:
         category_map = {}
+    
+    # Build direct base URL if provider info available
+    direct_base = None
+    if DIRECT_URLS and provider_info:
+        if provider_info.get('port', 80) == 80:
+            direct_base = f"http://{provider_info['host']}"
+        else:
+            direct_base = f"http://{provider_info['host']}:{provider_info['port']}"
+        logger.info(f"[DIRECT-URLS] Injecting direct URLs with base: {direct_base}")
     
     processed = []
     skipped_count = 0
@@ -661,12 +679,32 @@ def process_streams_json(data: list, category_map: dict = None, provider_name: s
                     else:
                         stream['name'] = normalized_name
                 
+                # Add direct source URL if enabled
+                if direct_base and provider_info:
+                    stream_id = stream.get('stream_id', '')
+                    if stream_id:
+                        # Determine file extension based on stream type
+                        if stream_type == 'live':
+                            ext = 'ts'
+                        elif stream_type == 'movie':
+                            ext = stream.get('container_extension', 'mkv')
+                        else:
+                            ext = 'ts'
+                        
+                        direct_url = (f"{direct_base}/{stream_type}/"
+                                     f"{provider_info['username']}/{provider_info['password']}/"
+                                     f"{stream_id}.{ext}")
+                        stream['direct_source'] = direct_url
+                
                 processed.append(stream)
         else:
             processed.append(stream)
     
     if skipped_count > 0:
         logger.info(f"Skipped suffixes for {skipped_count} streams (NO_SUFFIX_GROUPS)")
+    
+    if direct_base:
+        logger.info(f"[DIRECT-URLS] Added direct_source to {len(processed)} streams")
     
     return processed
 
@@ -1048,13 +1086,80 @@ async def test_normalization(name: str = None):
     })
 
 
+# Enable/disable smart validation (pre-test streams before redirecting)
+# This allows Dispatcharr's failover to work with Redirect mode
+SMART_VALIDATION = os.environ.get('SMART_VALIDATION', 'true').lower() in ('true', '1', 'yes')
+VALIDATION_TIMEOUT = float(os.environ.get('VALIDATION_TIMEOUT', '5'))  # seconds
+
+# Common User-Agent strings for validation (providers often check this)
+VALIDATION_USER_AGENTS = [
+    'TiviMate/5.1.6 (Android 12)',
+    'VLC/3.0.18 LibVLC/3.0.18',
+    'Lavf/60.3.100',
+]
+
+
+async def validate_provider_stream(url: str, timeout: float = VALIDATION_TIMEOUT) -> tuple[bool, int, str]:
+    """
+    Test if a provider stream URL is actually accessible.
+    Returns (success, status_code, error_message).
+    
+    Uses HEAD request first (fast), falls back to GET with range if needed.
+    """
+    headers = {
+        'User-Agent': VALIDATION_USER_AGENTS[0],
+        'Accept': '*/*',
+        'Connection': 'close',
+    }
+    
+    try:
+        # Try HEAD first (fastest)
+        async with http_session.head(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=True) as resp:
+            if resp.status in (200, 206):
+                logger.info(f"[VALIDATION] HEAD OK: {url} -> {resp.status}")
+                return True, resp.status, ""
+            elif resp.status == 405:
+                # Method Not Allowed - try GET with Range header instead
+                pass
+            else:
+                logger.warning(f"[VALIDATION] HEAD failed: {url} -> {resp.status}")
+                return False, resp.status, f"HEAD returned {resp.status}"
+    except asyncio.TimeoutError:
+        logger.warning(f"[VALIDATION] HEAD timeout: {url}")
+        return False, 0, "Timeout"
+    except Exception as e:
+        logger.warning(f"[VALIDATION] HEAD error: {url} -> {e}")
+        # Continue to try GET
+    
+    # Try GET with Range header (for providers that block HEAD)
+    headers['Range'] = 'bytes=0-1'  # Request just 2 bytes
+    try:
+        async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=True) as resp:
+            if resp.status in (200, 206):
+                logger.info(f"[VALIDATION] GET+Range OK: {url} -> {resp.status}")
+                return True, resp.status, ""
+            else:
+                logger.warning(f"[VALIDATION] GET+Range failed: {url} -> {resp.status}")
+                return False, resp.status, f"GET returned {resp.status}"
+    except asyncio.TimeoutError:
+        logger.warning(f"[VALIDATION] GET timeout: {url}")
+        return False, 0, "Timeout"
+    except Exception as e:
+        logger.warning(f"[VALIDATION] GET error: {url} -> {e}")
+        return False, 0, str(e)
+
+
 @app.head("/live/{username}/{password}/{stream_path:path}")
 @app.head("/movie/{username}/{password}/{stream_path:path}")
 @app.head("/series/{username}/{password}/{stream_path:path}")
 async def redirect_stream_head(username: str, password: str, stream_path: str, request: Request):
     """
-    Redirect HEAD requests to the actual provider.
-    Same as GET - we don't proxy video traffic.
+    Handle HEAD requests for streams with optional smart validation.
+    
+    If SMART_VALIDATION is enabled:
+    - Tests the actual provider URL before redirecting
+    - Returns 502 if provider stream is dead (triggers Dispatcharr failover)
+    - Returns 302 redirect only if stream is confirmed working
     """
     stream_type = request.url.path.split('/')[1]
     
@@ -1064,8 +1169,19 @@ async def redirect_stream_head(username: str, password: str, stream_path: str, r
     
     real_url = f"{provider['base_url']}/{stream_type}/{provider['username']}/{provider['password']}/{stream_path}"
     
-    logger.info(f"Stream HEAD REDIRECT: {stream_type}/{stream_path} -> {real_url}")
+    # Smart validation: test the provider stream before redirecting
+    if SMART_VALIDATION:
+        success, status_code, error = await validate_provider_stream(real_url)
+        if not success:
+            logger.warning(f"[SMART-VALIDATION] Stream DEAD: {stream_type}/{stream_path} -> {status_code} {error}")
+            # Return 502 Bad Gateway - tells Dispatcharr this stream is dead, try next
+            return PlainTextResponse(
+                f"Stream validation failed: {error}",
+                status_code=502
+            )
+        logger.info(f"[SMART-VALIDATION] Stream OK: {stream_type}/{stream_path}")
     
+    logger.info(f"Stream HEAD REDIRECT: {stream_type}/{stream_path} -> {real_url}")
     return RedirectResponse(url=real_url, status_code=302)
 
 
@@ -1074,14 +1190,15 @@ async def redirect_stream_head(username: str, password: str, stream_path: str, r
 @app.get("/series/{username}/{password}/{stream_path:path}")
 async def redirect_stream(username: str, password: str, stream_path: str, request: Request):
     """
-    Redirect stream requests to the actual provider.
+    Handle GET requests for streams with optional smart validation.
     
-    This ensures video traffic goes DIRECTLY to the provider,
-    not through this proxy. The proxy only handles:
-    - M3U playlist normalization
-    - API response normalization
+    If SMART_VALIDATION is enabled:
+    - Tests the actual provider URL before redirecting
+    - Returns 502 if provider stream is dead (triggers Dispatcharr failover)
+    - Returns 302 redirect only if stream is confirmed working
     
-    Video streams are redirected, not proxied.
+    This ensures video traffic goes DIRECTLY to the provider (not through proxy),
+    while still enabling Dispatcharr's failover mechanism for dead streams.
     """
     stream_type = request.url.path.split('/')[1]
     
@@ -1091,6 +1208,18 @@ async def redirect_stream(username: str, password: str, stream_path: str, reques
     
     # Build the direct URL to the provider
     real_url = f"{provider['base_url']}/{stream_type}/{provider['username']}/{provider['password']}/{stream_path}"
+    
+    # Smart validation: test the provider stream before redirecting
+    if SMART_VALIDATION:
+        success, status_code, error = await validate_provider_stream(real_url)
+        if not success:
+            logger.warning(f"[SMART-VALIDATION] Stream DEAD: {stream_type}/{stream_path} -> {status_code} {error}")
+            # Return 502 Bad Gateway - tells Dispatcharr this stream is dead, try next
+            return PlainTextResponse(
+                f"Stream validation failed: {error}",
+                status_code=502
+            )
+        logger.info(f"[SMART-VALIDATION] Stream OK: {stream_type}/{stream_path}")
     
     logger.info(f"Stream REDIRECT: {stream_type}/{stream_path} -> {real_url}")
     
@@ -1217,7 +1346,13 @@ async def player_api(request: Request, username: str = None, password: str = Non
         
         if action in normalize_actions:
             data = json.loads(raw)
-            data = process_streams_json(data, category_map, provider.get('provider_name', ''))
+            data = process_streams_json(
+                data, 
+                category_map, 
+                provider.get('provider_name', ''),
+                provider_info=provider,
+                stream_type='live'
+            )
             raw = json.dumps(data)
         
         if action not in no_cache_actions:
