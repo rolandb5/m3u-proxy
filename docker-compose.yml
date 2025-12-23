@@ -12,6 +12,10 @@ services:
       # Cache duration in hours (default: 6)
       - CACHE_HOURS=6
       
+      # Enable/disable channel name normalization (default: true)
+      # Set to false to pass through original names unchanged
+      - NORMALIZE_NAMES=true
+      
       # Groups that should NOT have (provider) (group) suffixes
       # For groups with "Auto Channel Sync" enabled in Dispatcharr
       # Format: comma-separated EXACT group names

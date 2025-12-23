@@ -20,6 +20,12 @@
 # Optional: Stream Naming Settings
 # =====================================================
 
+# Enable/disable channel name normalization
+# When true (default): Normalizes channel names (removes prefixes, cleans up)
+# When false: Passes through channel names unchanged from provider
+#
+# NORMALIZE_NAMES=true
+
 # Groups that should NOT have (provider) (group) suffixes added.
 # Useful for groups with "Auto Channel Sync" enabled in Dispatcharr,
 # where stream names become channel names directly.
@@ -44,6 +50,21 @@
 # Timeout for stream validation in seconds (default: 5)
 # Increase if your provider is slow to respond
 # VALIDATION_TIMEOUT=5
+
+# =====================================================
+# Optional: Video Proxying
+# =====================================================
+
+# Enable video proxying through this server
+# When false (default): Returns 302 redirect, video goes directly to provider
+# When true: Actually streams video through this proxy (uses bandwidth!)
+#
+# Use cases:
+# - false: Direct streaming, saves bandwidth, but client must follow redirects
+# - true: All traffic through proxy, works with any client, but uses bandwidth
+#
+# Default: false (redirect mode)
+# PROXY_VIDEO=false
 
 # =====================================================
 # Optional: Direct URL Injection

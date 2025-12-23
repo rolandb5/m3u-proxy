@@ -62,6 +62,11 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get('PORT', 8765))
 CACHE_HOURS = float(os.environ.get('CACHE_HOURS', 6))
 
+# Enable/disable channel name normalization
+# When True: Normalizes channel names (removes prefixes, cleans up names)
+# When False: Passes through channel names unchanged from provider
+NORMALIZE_NAMES = os.environ.get('NORMALIZE_NAMES', 'true').lower() in ('true', '1', 'yes')
+
 # Groups that should NOT have (provider) (group) suffixes added
 # These are typically groups with "Auto Channel Sync" enabled in Dispatcharr
 # Format: comma-separated list of EXACT group names (case-insensitive)
@@ -655,8 +660,11 @@ def process_streams_json(data: list, category_map: dict = None, provider_name: s
     for stream in data:
         if isinstance(stream, dict) and 'name' in stream:
             if not should_skip_channel(stream['name']):
-                # Normalize the base name
-                normalized_name = normalize_channel_name(stream['name'])
+                # Normalize the base name (if enabled)
+                if NORMALIZE_NAMES:
+                    normalized_name = normalize_channel_name(stream['name'])
+                else:
+                    normalized_name = stream['name']
                 
                 # Get group name from category map
                 category_id = str(stream.get('category_id', ''))
@@ -729,11 +737,13 @@ def process_m3u(content: str) -> str:
                     i += 2
                     continue
                 
-                name = normalize_channel_name(name)
-                prefix = RE_TVG_NAME.sub(
-                    lambda m: f'tvg-name="{normalize_channel_name(m.group(1))}"',
-                    prefix
-                )
+                # Normalize names if enabled
+                if NORMALIZE_NAMES:
+                    name = normalize_channel_name(name)
+                    prefix = RE_TVG_NAME.sub(
+                        lambda m: f'tvg-name="{normalize_channel_name(m.group(1))}"',
+                        prefix
+                    )
                 line = prefix + name
             output.append(line)
         else:
@@ -794,8 +804,11 @@ async def generate_m3u_from_api(provider: dict) -> str:
                 if not name or should_skip_channel(name):
                     continue
                 
-                # Normalize the base name
-                normalized_name = normalize_channel_name(name)
+                # Normalize the base name (if enabled)
+                if NORMALIZE_NAMES:
+                    normalized_name = normalize_channel_name(name)
+                else:
+                    normalized_name = name
                 
                 # Get group name
                 category_id = str(stream.get('category_id', ''))
@@ -1091,6 +1104,11 @@ async def test_normalization(name: str = None):
 SMART_VALIDATION = os.environ.get('SMART_VALIDATION', 'true').lower() in ('true', '1', 'yes')
 VALIDATION_TIMEOUT = float(os.environ.get('VALIDATION_TIMEOUT', '5'))  # seconds
 
+# Enable/disable video proxying
+# When True: Video streams through the proxy (Provider → Proxy → Client)
+# When False: Proxy returns 302 redirect (Provider → Client directly)
+PROXY_VIDEO = os.environ.get('PROXY_VIDEO', 'false').lower() in ('true', '1', 'yes')
+
 # Common User-Agent strings for validation (providers often check this)
 VALIDATION_USER_AGENTS = [
     'TiviMate/5.1.6 (Android 12)',
@@ -1188,17 +1206,18 @@ async def redirect_stream_head(username: str, password: str, stream_path: str, r
 @app.get("/live/{username}/{password}/{stream_path:path}")
 @app.get("/movie/{username}/{password}/{stream_path:path}")
 @app.get("/series/{username}/{password}/{stream_path:path}")
-async def redirect_stream(username: str, password: str, stream_path: str, request: Request):
+async def handle_stream(username: str, password: str, stream_path: str, request: Request):
     """
-    Handle GET requests for streams with optional smart validation.
+    Handle GET requests for streams.
     
-    If SMART_VALIDATION is enabled:
+    Behavior depends on PROXY_VIDEO setting:
+    - PROXY_VIDEO=false (default): Returns 302 redirect to provider
+    - PROXY_VIDEO=true: Actually proxies video through this server
+    
+    If SMART_VALIDATION is enabled (and not proxying):
     - Tests the actual provider URL before redirecting
     - Returns 502 if provider stream is dead (triggers Dispatcharr failover)
     - Returns 302 redirect only if stream is confirmed working
-    
-    This ensures video traffic goes DIRECTLY to the provider (not through proxy),
-    while still enabling Dispatcharr's failover mechanism for dead streams.
     """
     stream_type = request.url.path.split('/')[1]
     
@@ -1208,6 +1227,40 @@ async def redirect_stream(username: str, password: str, stream_path: str, reques
     
     # Build the direct URL to the provider
     real_url = f"{provider['base_url']}/{stream_type}/{provider['username']}/{provider['password']}/{stream_path}"
+    
+    # If PROXY_VIDEO is enabled, actually stream the video through this proxy
+    if PROXY_VIDEO:
+        logger.info(f"[PROXY-VIDEO] Proxying: {stream_type}/{stream_path} from {real_url}")
+        
+        headers = {
+            'User-Agent': 'TiviMate/5.1.6 (Android 12)',
+            'Accept': '*/*',
+        }
+        
+        # Forward range header if present
+        if 'range' in request.headers:
+            headers['Range'] = request.headers['range']
+        
+        try:
+            async def stream_generator():
+                async with http_session.get(real_url, headers=headers, timeout=aiohttp.ClientTimeout(total=None)) as resp:
+                    async for chunk in resp.content.iter_chunked(64 * 1024):  # 64KB chunks
+                        yield chunk
+            
+            # Get content type from provider
+            async with http_session.head(real_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as head_resp:
+                content_type = head_resp.headers.get('Content-Type', 'video/mp2t')
+            
+            return StreamingResponse(
+                stream_generator(),
+                media_type=content_type,
+                headers={'Accept-Ranges': 'bytes'}
+            )
+        except Exception as e:
+            logger.error(f"[PROXY-VIDEO] Error proxying stream: {e}")
+            return PlainTextResponse(f"Proxy error: {e}", status_code=502)
+    
+    # REDIRECT MODE (default): Just redirect to provider
     
     # Smart validation: test the provider stream before redirecting
     if SMART_VALIDATION:
@@ -1221,7 +1274,7 @@ async def redirect_stream(username: str, password: str, stream_path: str, reques
             )
         logger.info(f"[SMART-VALIDATION] Stream OK: {stream_type}/{stream_path}")
     
-    logger.info(f"Stream REDIRECT: {stream_type}/{stream_path} -> {real_url}")
+    logger.info(f"[REDIRECT] {stream_type}/{stream_path} -> {real_url}")
     
     # Return a redirect to the actual provider
     # 302 Found is used so clients don't cache the redirect
