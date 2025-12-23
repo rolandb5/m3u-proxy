@@ -13,7 +13,8 @@ services:
       - CACHE_HOURS=6
       
       # Enable/disable channel name normalization (default: true)
-      # Set to false to pass through original names unchanged
+      # When false: passes through original names unchanged (no normalization, no suffixes)
+      # When true: normalizes names and adds (provider) (group) suffixes
       - NORMALIZE_NAMES=true
       
       # Groups that should NOT have (provider) (group) suffixes

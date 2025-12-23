@@ -660,11 +660,13 @@ def process_streams_json(data: list, category_map: dict = None, provider_name: s
     for stream in data:
         if isinstance(stream, dict) and 'name' in stream:
             if not should_skip_channel(stream['name']):
-                # Normalize the base name (if enabled)
-                if NORMALIZE_NAMES:
-                    normalized_name = normalize_channel_name(stream['name'])
-                else:
-                    normalized_name = stream['name']
+                # If normalization is disabled, pass through unchanged
+                if not NORMALIZE_NAMES:
+                    processed.append(stream)
+                    continue
+                
+                # Normalize the base name
+                normalized_name = normalize_channel_name(stream['name'])
                 
                 # Get group name from category map
                 category_id = str(stream.get('category_id', ''))
@@ -804,21 +806,19 @@ async def generate_m3u_from_api(provider: dict) -> str:
                 if not name or should_skip_channel(name):
                     continue
                 
-                # Normalize the base name (if enabled)
-                if NORMALIZE_NAMES:
-                    normalized_name = normalize_channel_name(name)
-                else:
-                    normalized_name = name
-                
                 # Get group name
                 category_id = str(stream.get('category_id', ''))
                 group_title = category_map.get(category_id, '')
                 
-                # Check if this group should skip suffixes
-                if should_skip_suffix(group_title):
-                    final_name = normalized_name
+                # If normalization is disabled, pass through unchanged
+                if not NORMALIZE_NAMES:
+                    final_name = name
+                elif should_skip_suffix(group_title):
+                    # Normalize but no suffix
+                    final_name = normalize_channel_name(name)
                 else:
-                    # Final name format: NORMALIZED_NAME (PROVIDER) (GROUP_NAME)
+                    # Normalize + suffix: NORMALIZED_NAME (PROVIDER) (GROUP_NAME)
+                    normalized_name = normalize_channel_name(name)
                     suffix_parts = []
                     if provider_name:
                         suffix_parts.append(f"({provider_name})")

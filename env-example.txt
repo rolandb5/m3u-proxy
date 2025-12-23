@@ -21,8 +21,8 @@
 # =====================================================
 
 # Enable/disable channel name normalization
-# When true (default): Normalizes channel names (removes prefixes, cleans up)
-# When false: Passes through channel names unchanged from provider
+# When true (default): Normalizes channel names AND adds (provider) (group) suffixes
+# When false: Passes through channel names completely unchanged (no normalization, no suffixes)
 #
 # NORMALIZE_NAMES=true
 
